@@ -1,0 +1,547 @@
+
+
+
+# Survival Status Prediction from CNA Enhanced + Other Categorical Predictors
+
+```{r}
+
+suppressPackageStartupMessages({
+library(tidyr)
+library(dplyr)
+library(pROC)
+library(randomForest)
+library(ggplot2)
+library(MASS)
+library(glmnet)
+library(ranger)
+library(doParallel)
+library(foreach)
+library(xgboost)
+library(dbarts)
+})
+
+
+```
+
+```{r}
+
+#Profile_description: Putative copy-number from GISTIC 2.0. Values: -2 = homozygous deletion; -1 = hemizygous deletion; 0 = neutral / no change; 1 = gain; 2 = high level amplification.
+#Profile_name: Putative copy-number alterations from GISTIC
+data_cna = read.delim("/Users/ali/Downloads/msk_chord_2024/data_cna.txt", header = T)
+data_cna = data.frame(t(data_cna))
+colnames(data_cna) = data_cna[1,]
+data_cna = data_cna[-1,]
+row.names(data_cna) = gsub("\\.","-",row.names(data_cna))
+data_cna[] <- lapply(data_cna, as.integer)
+data_cna$Sample_ID = row.names(data_cna)
+
+#-------------------------------------------------------------------------------
+
+#Clinical data directly from cBioPortal
+
+clinical_data_cbio = read.delim("/Users/ali/Downloads/msk_chord_2024_clinical_data-2.tsv")
+
+```
+
+### Custom functions
+
+```{r}
+
+set.seed(1010)
+
+#Removes columns that have NAs in them - machine learning models cannot handle NAs; difficult to impute values when placeholders such as "0" might be used to singify a disease state. Imputation is difficult without making big assumptions, especially since this is beca use some test may not have been performed for certain patients. Therefore, I removed those columns entirely. 
+na_cleanup_columns = function(dataframe)
+{
+  return(dataframe[,colSums(is.na(dataframe)) == 0])
+}
+
+#-------------------------------------------------------------------------------
+
+#Creates training rows
+train_rows = function(x)
+{
+  sample(1:nrow(x),nrow(x)*(2/3), replace = F)
+}
+
+#-------------------------------------------------------------------------------
+
+#Custom function that uses glmnet to compute ROC and AUC using parallel computing for logistic regression with varying degrees of L1 and L2 penalties, essentially switching between Ridge, Lasso, and Elastic-net. 
+
+set.seed(1010)
+
+#-------------------------------------------------------------------------------
+
+# Elastic Net Regression using glmnet
+elastic_net_regression = function(training_x, training_y, a, folds, testing_x, testing_y, parallel) {
+  
+  if (parallel == TRUE) {
+    # Set up parallel backend
+    cores = parallel::detectCores()
+    cl = makeCluster(cores * (1 / 2))
+    registerDoParallel(cl)
+    
+    cv_elastic_net = cv.glmnet(as.matrix(training_x), training_y, alpha = a, nfolds = folds, parallel = TRUE)
+    
+    # Shut down parallel backend
+    stopCluster(cl)
+    registerDoSEQ()
+  } else {
+    cv_elastic_net = cv.glmnet(as.matrix(training_x), training_y, alpha = a, nfolds = folds)
+  }
+  
+  # Predictions on test set
+  predictions = predict(cv_elastic_net, newx = as.matrix(testing_x), s = cv_elastic_net$lambda.1se)
+  
+  # Calculate metrics
+  mse = mean((predictions - testing_y)^2)
+  r2 = 1 - (sum((predictions - testing_y)^2) / sum((testing_y - mean(testing_y))^2))
+  
+  coefficients_glmnet = as.data.frame(as.matrix(coef(cv_elastic_net, s = cv_elastic_net$lambda.1se)))
+  coefficients_glmnet$Genes = row.names(coefficients_glmnet)
+  genes_selected = coefficients_glmnet[coefficients_glmnet$s1 != 0,][-1,]  # Removing the intercept
+  
+  return(list(MSE = mse, R2 = r2, Genes = genes_selected))
+}
+
+#-------------------------------------------------------------------------------
+
+# Linear Discriminant Analysis (adapted for regression)
+LDA_regression = function(training_data, testing_x, testing_y) {
+  
+  lda_model = lda(Response_Var ~ ., data = training_data)
+  
+  # Make predictions
+  predictions = predict(lda_model, newdata = testing_x)$x  # Obtain predicted values
+  
+  # Calculate metrics
+  mse = mean((predictions - testing_y)^2)
+  r2 = 1 - (sum((predictions - testing_y)^2) / sum((testing_y - mean(testing_y))^2))
+  
+  return(list(MSE = mse, R2 = r2))
+}
+
+#-------------------------------------------------------------------------------
+
+# Logistic Regression adapted for regression
+linear_regression = function(training_data, testing_x, testing_y) {
+  
+  model = lm(Response_Var ~ ., data = training_data)
+  
+  predictions = predict(model, newdata = testing_x)
+  
+  mse = mean((predictions - testing_y)^2)
+  r2 = 1 - (sum((predictions - testing_y)^2) / sum((testing_y - mean(testing_y))^2))
+  
+  return(list(MSE = mse, R2 = r2))
+}
+
+#-------------------------------------------------------------------------------
+
+# Random Forest Regression using ranger
+random_forest_ranger = function(training_data, training_y, testing_x, testing_y, num_trees, mtry = NA, cores = NA) {
+  
+  if (is.na(mtry)) {
+    mtry = floor(sqrt(ncol(training_data)))
+  }
+  
+  if (is.na(cores)) {
+    cores = 1
+  }
+  
+  rf_model = ranger(dependent.variable.name = training_y,
+                    data = training_data,
+                    mtry = mtry,
+                    num.trees = num_trees,
+                    importance = "impurity",
+                    num.threads = cores)
+  
+  # Predictions
+  predictions = predict(rf_model, data = testing_x)$predictions
+  
+  # Calculate metrics
+  mse = mean((predictions - testing_y)^2)
+  r2 = 1 - (sum((predictions - testing_y)^2) / sum((testing_y - mean(testing_y))^2))
+  
+  variable_importance = as.data.frame(rf_model$variable.importance)
+  variable_importance$Variable = rownames(variable_importance)
+  colnames(variable_importance) = c("Importance", "Variable")
+  
+  variable_importance = variable_importance[order(variable_importance$Importance, decreasing = TRUE), ]
+  
+  return(list(MSE = mse, R2 = r2, VarImportance = variable_importance))
+}
+
+#-------------------------------------------------------------------------------
+
+# XGBoost Regression
+xgboost_parallel = function(training_x, training_y, testing_x, testing_y, learning_rate = NA, cores = NA, n_tree = NA, tree_depth = NA) {
+  
+  if (is.na(learning_rate)) {
+    learning_rate = 0.3
+  }
+  
+  if (is.na(cores)) {
+    cores = 1
+  }
+  
+  if (is.na(n_tree)) {
+    n_tree = 500
+  }
+  
+  if (is.na(tree_depth)) {
+    tree_depth = 6
+  }
+  
+  # Prepare data
+  xgb_train = xgb.DMatrix(data = as.matrix(training_x), label = training_y)
+  xgb_test = xgb.DMatrix(data = as.matrix(testing_x))
+  
+  # Define hyperparameters
+  xgb_params = list(objective = "reg:squarederror",  # Regression
+                    eta = learning_rate,
+                    max_depth = tree_depth)
+  
+  # Train XGBoost model
+  xgb_model = xgb.train(params = xgb_params,
+                        data = xgb_train,
+                        nrounds = n_tree,
+                        nthread = cores,
+                        verbose = 0)
+  
+  # Make predictions
+  predictions = predict(xgb_model, xgb_test)
+  
+  # Calculate metrics
+  mse = mean((predictions - testing_y)^2)
+  r2 = 1 - (sum((predictions - testing_y)^2) / sum((testing_y - mean(testing_y))^2))
+  
+  # Variable importance
+  xgb_importance = xgb.importance(model = xgb_model, feature_names = colnames(as.matrix(training_x))) %>%
+    arrange(desc(Gain))
+  
+  return(list(MSE = mse, R2 = r2, VarImportance = xgb_importance))
+}
+
+
+#-------------------------------------------------------------------------------
+
+#This function builds a training set based on whichever features we want
+
+training_set_builder = function(feature_y, data, data_2, cbio_clinical_features = NULL, convert_factor = FALSE, cna_columns = NULL)
+
+{
+
+if (isTRUE(convert_factor)) {
+  factor_cols = which(unlist(lapply(data_2[, cbio_clinical_features], is.character)))
+  
+  # Convert the selected character columns to numeric using factor conversion
+  data_2[, cbio_clinical_features][,factor_cols] <- lapply(data_2[, cbio_clinical_features][factor_cols], function(x) as.numeric(as.factor(x))-1)
+  
+}
+  
+if (is.null(cbio_clinical_features))
+{
+  clinical_cna_data_with_more_markers = na.omit(inner_join(data, 
+                                                         data_2[,c("Sample.ID",
+                                                                               "Current.Age",
+                                                                               "Fraction.Genome.Altered",
+                                                                               "MSI.Score",
+                                                                               "Mutation.Count",
+                                                                               "Stage..Highest.Recorded.")], 
+                                                         by = c("Sample.ID" = "Sample.ID")))
+}
+  
+else if (!is.null(cbio_clinical_features))  
+{
+#Use this code to add any other features to the dataset
+clinical_cna_data_with_more_markers = na.omit(inner_join(data, 
+                                                         data_2[,c("Sample.ID",cbio_clinical_features)], 
+                                                         by = c("Sample.ID" = "Sample.ID")))
+}
+
+
+clinical_cna_data_for_model = clinical_cna_data_with_more_markers
+
+#-------------------------------------------------------------------------------
+
+
+cbio_clinical_features[which(!(cbio_clinical_features) %in% colnames(clinical_cna_data_for_model))] = paste0(cbio_clinical_features[which(!(cbio_clinical_features)%in% colnames(clinical_cna_data_for_model))],".y")
+
+#-------------------------------------------------------------------------------
+  
+training_rows = train_rows(clinical_cna_data_for_model)
+training_data = clinical_cna_data_for_model[training_rows,] 
+testing_data = clinical_cna_data_for_model[-training_rows,] 
+
+
+#-------------------------------------------------------------------------------
+
+  # Training X
+  training_x = training_data[, cbio_clinical_features]  
+  training_x = training_x[, -which(names(training_x) == feature_y)]
+
+  if (!is.null(cna_columns))
+  {
+    cna_training = training_data[, cna_columns]  
+    feature_training = training_data[, cbio_clinical_features]
+    training_x = cbind(cna_training, feature_training)
+    training_x = training_x[, -which(names(training_x) == feature_y)]
+  }
+
+  # Training Y
+  training_y = training_data[[feature_y]]
+
+  # -------------------------------------------------------------------------------
+
+  data_for_x_y_combined_models = cbind(Response_Var = training_y, training_x)
+
+  # -------------------------------------------------------------------------------
+  # Testing X
+  testing_x = testing_data[, cbio_clinical_features]  
+  testing_x = testing_x[, -which(names(testing_x) == feature_y)]
+
+  if (!is.null(cna_columns))
+  {
+    cna_testing = testing_data[, cna_columns]  
+    feature_testing = testing_data[, cbio_clinical_features]
+    testing_x = cbind(cna_testing, feature_testing)
+    testing_x = testing_x[, -which(names(testing_x) == feature_y)]
+  }
+
+  # Testing Y
+  testing_y = testing_data[[feature_y]]
+
+#-------------------------------------------------------------------------------
+
+return(list(training_x = training_x,
+            training_y = training_y,
+            testing_x = testing_x,
+            testing_y = testing_y,
+            combined_data = data_for_x_y_combined_models,
+            Before_Processing = dim(data),
+            After_Processing = dim(clinical_cna_data_with_more_markers)))
+}
+
+```
+
+
+
+```{r}
+
+set.seed(1010)
+
+clinical_cna_data = na_cleanup_columns(inner_join(clinical_data_cbio, data_cna, by = c("Sample.ID" = "Sample_ID")))
+
+model_data = training_set_builder(feature_y = "Current.Age", 
+                                data = clinical_cna_data, 
+                                data_2 = clinical_data_cbio, 
+                                cbio_clinical_features = c("Current.Age",
+                                                           "Fraction.Genome.Altered",
+                                                           "MSI.Score",
+                                                           "Mutation.Count",
+                                                           "Stage..Highest.Recorded.",
+                                                           "Sample.Type",
+                                                           "HER2",
+                                                           "Overall.Survival..Months.",
+                                                           "Overall.Survival.Status"),
+                                convert_factor = TRUE,
+                                cna_columns = colnames(clinical_cna_data[,36:ncol(clinical_cna_data)]))
+
+
+
+```
+
+
+
+#### Logistic Regression
+
+```{r}
+
+logistic_roc = linear_regression(training_data = model_data$combined_data,
+                                   testing_x = model_data$testing_x,
+                                   testing_y = model_data$testing_y)  
+
+```
+
+#### Logistic Regression with L1 and L2 penalty (Ridge, Lasso, Elastic Net)
+
+```{r}
+
+ridge_roc = elastic_net_regression(training_x = model_data$training_x,
+                                 training_y = model_data$training_y,
+                                 testing_x = model_data$testing_x,
+                                 testing_y = model_data$testing_y, 
+                                 a = 0,
+                                 folds = 5,
+                                 parallel = TRUE)
+
+lasso_roc = elastic_net_regression(training_x = model_data$training_x,
+                                 training_y = model_data$training_y,
+                                 testing_x = model_data$testing_x,
+                                 testing_y = model_data$testing_y, 
+                                 a = 1,
+                                 folds = 5,
+                                 parallel = TRUE)
+
+elastic_net_roc = elastic_net_regression(training_x = model_data$training_x,
+                                 training_y = model_data$training_y,
+                                 testing_x = model_data$testing_x,
+                                 testing_y = model_data$testing_y, 
+                                 a = 1,
+                                 folds = 5,
+                                 parallel = TRUE)
+
+```
+
+#### Linear discriminant analysis
+
+```{r}
+
+LDA_roc = LDA_regression(training_data = model_data$combined_data,
+                                   testing_x = model_data$testing_x,
+                                   testing_y = model_data$testing_y)
+
+#QDA did not work - "Rank deficiency in 0" error. 
+
+```
+
+#### Random Forest
+
+```{r}
+
+randomforest_roc = random_forest_ranger(training_data = model_data$combined_data,
+                                        training_y = "Response_Var",
+                                        testing_x = model_data$testing_x,
+                                        testing_y = model_data$testing_y,
+                                        num_trees = 500,
+                                        cores = (detectCores()/2))
+
+```
+
+```{r}
+
+xgboost_roc = xgboost_parallel(training_x = model_data$training_x,
+                               training_y = model_data$training_y,
+                               testing_x = model_data$testing_x,
+                               testing_y = model_data$testing_y,
+                               learning_rate = 0.2,
+                               cores = (detectCores()/2),
+                               n_tree = 500,
+                               tree_depth = 5) 
+
+```
+
+#### ROC Compilation
+
+```{r}
+
+# Combine MSE and R² metrics for all models into a single data frame
+all_models_metrics = data.frame(
+  Model = c("Ridge Logistic", "Lasso Logistic", "Elastic Net Logistic",
+            "Logistic Regression", "Random Forest", "XGBoost"),
+  MSE = c(ridge_roc$MSE, lasso_roc$MSE, elastic_net_roc$MSE,
+          logistic_roc$MSE, randomforest_roc$MSE,#LDA_roc$MSE, 
+          xgboost_roc$MSE),
+  R2 = c(ridge_roc$R2, lasso_roc$R2, elastic_net_roc$R2,
+         logistic_roc$R2, randomforest_roc$R2, #LDA_roc$R2, 
+         xgboost_roc$R2)
+)
+
+# Convert the data frame into a long format for easier plotting
+all_models_metrics_long = all_models_metrics %>%
+  pivot_longer(cols = c(MSE, R2), names_to = "Metric", values_to = "Value")
+
+
+# Bar plot for MSE and R² metrics
+ggplot(all_models_metrics_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  labs(
+    title = "Model Performance Metrics (MSE and R²)",
+    x = "Model",
+    y = "Metric Value",
+    fill = "Metric"
+  ) +
+  scale_fill_manual(values = c("MSE" = "lightblue2", "R2" = "violet")) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+
+```
+
+## Feature Selection
+
+```{r}
+
+genes_common_to_all_models = Reduce(intersect,
+                                    list(ridge_roc$Genes$Genes,
+                                         lasso_roc$Genes$Genes,
+                                         elastic_net_roc$Genes$Genes,
+                                         randomforest_roc$VarImportance$Variable[randomforest_roc$VarImportance$Importance > 10],
+                                         xgboost_roc$VarImportance$Feature[xgboost_roc$VarImportance$Gain > 1E-02]))
+
+
+combined_xgb_rf = inner_join(randomforest_roc$VarImportance[randomforest_roc$VarImportance$Variable %in%
+                                                              genes_common_to_all_models, ],
+                             xgboost_roc$VarImportance, by = c("Variable" = "Feature"))
+
+
+df_scaled = combined_xgb_rf %>%
+  mutate(Importance_scaled = (Importance - min(Importance)) / (max(Importance) - min(Importance)),
+         Gain_scaled = (Gain - min(Gain)) / (max(Gain) - min(Gain)))
+
+# Reshape the scaled data to long format
+df_long = df_scaled %>%
+  gather(key = "Type", value = "Value", Importance_scaled, Gain_scaled) %>%
+  mutate(Model = ifelse(Type == "Importance_scaled", "Random Forest", "XGBoost"))
+
+# Plot
+ggplot(df_long, aes(x = reorder(Variable, Value), y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Random Forest" = "springgreen2", "XGBoost" = "violetred2")) +
+  labs(
+    title = "Scaled Variable Importance | Random Forest vs. XGBoost",
+    x = "Variables",
+    y = "Scaled Importance/Gain",
+    fill = "Model"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

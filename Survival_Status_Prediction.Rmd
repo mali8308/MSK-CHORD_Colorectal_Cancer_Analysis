@@ -1,0 +1,544 @@
+
+
+# Survival Status Prediction from CNA Enhanced + Other Categorical Predictors
+
+```{r}
+
+suppressPackageStartupMessages({
+library(tidyr)
+library(dplyr)
+library(pROC)
+library(randomForest)
+library(ggplot2)
+library(MASS)
+library(glmnet)
+library(ranger)
+library(doParallel)
+library(foreach)
+library(xgboost)
+library(dbarts)
+})
+
+
+```
+
+```{r}
+
+#Profile_description: Putative copy-number from GISTIC 2.0. Values: -2 = homozygous deletion; -1 = hemizygous deletion; 0 = neutral / no change; 1 = gain; 2 = high level amplification.
+#Profile_name: Putative copy-number alterations from GISTIC
+data_cna = read.delim("/Users/ali/Downloads/msk_chord_2024/data_cna.txt", header = T)
+data_cna = data.frame(t(data_cna))
+colnames(data_cna) = data_cna[1,]
+data_cna = data_cna[-1,]
+row.names(data_cna) = gsub("\\.","-",row.names(data_cna))
+data_cna[] <- lapply(data_cna, as.integer)
+data_cna$Sample_ID = row.names(data_cna)
+
+#-------------------------------------------------------------------------------
+
+#Clinical data directly from cBioPortal
+
+clinical_data_cbio = read.delim("/Users/ali/Downloads/msk_chord_2024_clinical_data-2.tsv")
+
+```
+
+### Custom functions
+
+```{r}
+
+set.seed(1010)
+
+#Removes columns that have NAs in them - machine learning models cannot handle NAs; difficult to impute values when placeholders such as "0" might be used to singify a disease state. Imputation is difficult without making big assumptions, especially since this is beca use some test may not have been performed for certain patients. Therefore, I removed those columns entirely. 
+na_cleanup_columns = function(dataframe)
+{
+  return(dataframe[,colSums(is.na(dataframe)) == 0])
+}
+
+#-------------------------------------------------------------------------------
+
+#Creates training rows
+train_rows = function(x)
+{
+  sample(1:nrow(x),nrow(x)*(2/3), replace = F)
+}
+
+#-------------------------------------------------------------------------------
+
+#Custom function that uses glmnet to compute ROC and AUC using parallel computing for logistic regression with varying degrees of L1 and L2 penalties, essentially switching between Ridge, Lasso, and Elastic-net. 
+
+elastic_net_logistic = function(training_x, training_y, a, folds, testing_x, testing_y, parallel)
+
+{
+
+if (parallel == TRUE)
+{
+  # Set up parallel backend
+  cores = parallel::detectCores()
+  cl = makeCluster(cores*(1/2))
+  registerDoParallel(cl)
+  
+  cv_lasso_logistic = cv.glmnet(as.matrix(training_x), training_y, family = "binomial", alpha = a, nfolds = folds, parallel = TRUE)
+  
+  # Shut down parallel backend
+  stopCluster(cl)
+  registerDoSEQ()
+}
+
+else
+{cv_lasso_logistic = cv.glmnet(as.matrix(training_x), training_y, family = "binomial", alpha = a, nfolds = folds)}
+
+testing_x_regularized_logisitic = as.matrix(testing_x)
+lasso_probs = predict(cv_lasso_logistic, 
+                      newx = testing_x_regularized_logisitic,
+                      type = "response",
+                      s=cv_lasso_logistic$lambda.1se)
+
+coefficients_glmnet = as.data.frame(as.matrix(coef(cv_lasso_logistic, s = cv_lasso_logistic$lambda.1se)))
+coefficients_glmnet$Genes = row.names(coefficients_glmnet)
+genes_selected = coefficients_glmnet[coefficients_glmnet$s1 != 0,][-1,] #removing the intercept
+
+# Calculate AUC
+roc_lasso = pROC::roc(testing_y, lasso_probs)
+
+# Plot ROC Curve
+roc_data = data.frame(TPR = roc_lasso$sensitivities, 
+                      FPR = 1 - roc_lasso$specificities)
+
+return(list(ROC_Data = roc_data, AUC = roc_lasso$auc, Genes = genes_selected))
+
+}
+
+#-------------------------------------------------------------------------------
+
+LDA_function = function(training_data, testing_x, testing_y)
+
+{
+  
+lda_model = lda(Cancer_Type ~ ., data = training_data)
+
+# Make predictions
+lda_predictions = predict(lda_model, newdata = testing_x)
+
+# Predicted probabilities for ROC curve
+lda_probs = lda_predictions$posterior[, 2]  # Probabilities for class "1"
+
+# Calculate AUC
+lda_roc = pROC::roc(testing_y, lda_probs)
+
+# Plot ROC curve
+lda_roc_data = data.frame(TPR = lda_roc$sensitivities, 
+                          FPR = 1 - lda_roc$specificities)
+
+return(list(ROC_Data = lda_roc_data, AUC = lda_roc$auc))
+
+}
+
+#-------------------------------------------------------------------------------
+
+logistic_regression = function(training_data, testing_x, testing_y)
+  
+{
+
+logistic_model = glm(Cancer_Type ~ ., 
+                     data = training_data, 
+                     family = "binomial")
+
+predictions = predict(logistic_model, 
+                      newdata = testing_x,
+                      type = "response")
+
+roc_curve = pROC::roc(testing_y, predictions)
+
+# Extract ROC curve data
+roc_data = data.frame(TPR = roc_curve$sensitivities,  # True positive rate
+                      FPR = 1 - roc_curve$specificities)  # False positive rate
+
+return(list(ROC_Data = roc_data, AUC = roc_curve$auc))
+
+}
+
+#-------------------------------------------------------------------------------
+
+random_forest_ranger = function(training_data, training_y, testing_x, testing_y, num_trees, mtry = NA, cores = NA)
+
+{
+  
+mtry_value = mtry
+
+if (is.na(mtry))
+{
+mtry_value = floor(sqrt(ncol(training_data)))  
+}
+
+if (is.na(cores))
+{
+cores = 1
+}
+
+rf_model = ranger(dependent.variable.name = training_y,
+                  data = training_data,
+                  mtry = mtry_value,
+                  num.trees = num_trees,
+                  importance = "impurity",
+                  probability = TRUE,
+                  num.threads = cores)  # Number of cores to use
+
+rf_probs = predict(rf_model, data = testing_x)$predictions[, 2]
+
+rf_roc = pROC::roc(testing_y, rf_probs)
+
+rf_roc_data = data.frame(TPR = rf_roc$sensitivities, 
+                         FPR = 1 - rf_roc$specificities)
+
+variable_importance = as.data.frame(rf_model$variable.importance)
+variable_importance$Variable = rownames(variable_importance)
+colnames(variable_importance) = c("Importance", "Variable")
+
+variable_importance = variable_importance[order(variable_importance$Importance, decreasing = TRUE), ]
+
+return(list(ROC_Data = rf_roc_data, AUC = rf_roc$auc, VarImportance = variable_importance))
+
+}
+
+#-------------------------------------------------------------------------------
+
+xgboost_parallel = function(training_x, training_y, testing_x, testing_y, learning_rate = NA, cores = NA, n_tree = NA, tree_depth = NA)
+
+{
+  
+if(is.na(learning_rate))
+{
+  learning_rate = 0.3
+}
+
+if(is.na(cores))
+{
+  cores = 1
+}
+
+if(is.na(n_tree))
+{
+  n_tree = 500
+}
+  
+if(is.na(tree_depth))
+{
+  tree_depth = 6
+}
+
+# Separate features and target
+X_train = as.matrix(training_x)
+y_train = as.numeric(training_y)   # Ensure labels are 0-based
+
+X_test = as.matrix(testing_x)
+y_test = as.numeric(testing_y)   # Ensure labels are 0-based
+
+#y_test = as.numeric(test_data_xgb$Cancer.Type) - 1  # Ensure labels are 0-based
+
+
+# Define hyperparameters
+xgb_params = list(objective = "binary:logistic",  # Binary classification
+                  eval_metric = "auc",
+                  max_depth = tree_depth,        # Tree depth
+                  eta = learning_rate)           # Learning rate
+
+# Train the XGBoost model
+xgb_train = xgb.DMatrix(data = X_train, label = y_train)
+
+xgb_model = xgb.train(params = xgb_params,
+                      data = xgb_train,
+                      nrounds = n_tree,
+                      nthread = cores,
+                      verbose = 0)
+
+# Make predictions
+xgb_test = xgb.DMatrix(data = X_test)
+xgb_probs = predict(xgb_model, xgb_test)
+
+# Calculate ROC and plot
+xgb_roc = pROC::roc(y_test, xgb_probs)
+
+xgb_roc_data = data.frame(TPR = xgb_roc$sensitivities,
+                          FPR = 1 - xgb_roc$specificities)
+
+# Variable importance
+xgb_importance = xgb.importance(model = xgb_model, feature_names = colnames(X_train)) %>%
+  arrange(desc(Gain))
+
+return(list(ROC_Data = xgb_roc_data, AUC = xgb_roc$auc, VarImportance = xgb_importance))
+
+}
+
+#-------------------------------------------------------------------------------
+
+
+```
+
+**Training & testing split**
+
+```{r}
+
+set.seed(1010)
+
+clinical_cna_data = na_cleanup_columns(inner_join(clinical_data_cbio, data_cna, by = c("Sample.ID" = "Sample_ID")))
+
+dim(clinical_cna_data)
+
+#Use this code to add any other features to the dataset
+clinical_cna_data_with_more_markers = na.omit(inner_join(clinical_cna_data, 
+                                                         clinical_data_cbio[,c("Sample.ID",
+                                                                               "Current.Age",
+                                                                               "Fraction.Genome.Altered",
+                                                                               "MSI.Score",
+                                                                               "Mutation.Count",
+                                                                               "Stage..Highest.Recorded.")], 
+                                                         by = c("Sample.ID" = "Sample.ID")))
+
+dim(clinical_cna_data_with_more_markers)
+
+clinical_cna_data_for_model = clinical_cna_data_with_more_markers
+
+clinical_cna_data_for_model$Cancer.Type[clinical_cna_data_for_model$Cancer.Type == "Colorectal Cancer"] = 1
+clinical_cna_data_for_model$Cancer.Type[clinical_cna_data_for_model$Cancer.Type != 1] = 0
+
+#-------------------------------------------------------------------------------
+
+#Training-testing split
+training_rows = train_rows(clinical_cna_data_for_model)
+training_data = clinical_cna_data_for_model[training_rows,] 
+testing_data = clinical_cna_data_for_model[-training_rows,] 
+
+#-------------------------------------------------------------------------------
+
+#Training X
+training_x = training_data[, 36:ncol(training_data)] # Select predictors from column 36 onward
+training_x$Stage..Highest.Recorded..y = as.integer(as.factor(training_x$Stage..Highest.Recorded..y))
+
+#Training Y
+training_y = as.integer(as.factor(training_data$Overall.Survival.Status))-1   # Convert response variable to factor
+
+#Testing X
+testing_x = testing_data[, 36:ncol(testing_data)] # Select predictors from column 36 onward
+testing_x$Stage..Highest.Recorded..y = as.integer(as.factor(testing_x$Stage..Highest.Recorded..y))
+
+#Testing Y
+testing_y = as.integer(as.factor(testing_data$Overall.Survival.Status))-1  # True labels
+
+data_for_x_y_combined_models = cbind(Cancer_Type = training_y, training_x)
+
+
+
+```
+
+
+
+#### Logistic Regression
+
+```{r}
+
+logistic_roc = logistic_regression(training_data = data_for_x_y_combined_models,
+                                   testing_x = testing_x,
+                                   testing_y = testing_y)  
+
+```
+
+#### Logistic Regression with L1 and L2 penalty (Ridge, Lasso, Elastic Net)
+
+```{r}
+
+ridge_roc = elastic_net_logistic(training_x = training_x,
+                                 training_y = training_y,
+                                 testing_x = testing_x,
+                                 testing_y = testing_y, 
+                                 a = 0,
+                                 folds = 5,
+                                 parallel = TRUE)
+
+lasso_roc = elastic_net_logistic(training_x = training_x,
+                                 training_y = training_y,
+                                 testing_x = testing_x,
+                                 testing_y = testing_y, 
+                                 a = 1,
+                                 folds = 5,
+                                 parallel = TRUE)
+
+elastic_net_roc = elastic_net_logistic(training_x = training_x,
+                                 training_y = training_y,
+                                 testing_x = testing_x,
+                                 testing_y = testing_y, 
+                                 a = 1,
+                                 folds = 5,
+                                 parallel = TRUE)
+
+```
+
+#### Linear discriminant analysis
+
+```{r}
+
+LDA_roc = LDA_function(training_data = data_for_x_y_combined_models,
+                       testing_x = testing_x,
+                       testing_y = testing_y)
+
+#QDA did not work - "Rank deficiency in 0" error. 
+
+```
+
+#### Random Forest
+
+```{r}
+
+randomforest_roc = random_forest_ranger(training_data = data_for_x_y_combined_models,
+                                        training_y = "Cancer_Type",
+                                        testing_x = testing_x,
+                                        testing_y = testing_y,
+                                        num_trees = 500,
+                                        cores = (detectCores()/2))
+
+```
+
+```{r}
+
+xgboost_roc = xgboost_parallel(training_x = training_x,
+                               training_y = training_y,
+                               testing_x = testing_x,
+                               testing_y = testing_y,
+                               learning_rate = 0.2,
+                               cores = (detectCores()/2),
+                               n_tree = 500,
+                               tree_depth = 5) 
+
+```
+
+#### ROC Compilation
+
+```{r}
+
+all_models_ROC = data.frame(TPR = ridge_roc$ROC_Data$TPR,
+                            FPR = ridge_roc$ROC_Data$FPR,
+                            Model = rep("Ridge Logistic", nrow(ridge_roc$ROC_Data)),
+                            AUC = rep(ridge_roc$AUC[1], nrow(ridge_roc$ROC_Data)))
+
+all_models_ROC = rbind(all_models_ROC, cbind(lasso_roc$ROC_Data, 
+                                             Model = rep("Lasso Logistic", nrow(lasso_roc$ROC_Data)),
+                                             AUC = rep(lasso_roc$AUC[1], nrow(lasso_roc$ROC_Data))))
+
+all_models_ROC = rbind(all_models_ROC, cbind(elastic_net_roc$ROC_Data, 
+                                             Model = rep("Elastic Net Logistic", nrow(elastic_net_roc$ROC_Data)),
+                                             AUC = rep(elastic_net_roc$AUC[1], nrow(elastic_net_roc$ROC_Data))))
+
+
+all_models_ROC = rbind(all_models_ROC, cbind(logistic_roc$ROC_Data, 
+                                             Model = rep("Logistic Regression", nrow(logistic_roc$ROC_Data)),
+                                             AUC = rep(logistic_roc$AUC[1], nrow(logistic_roc$ROC_Data))))
+
+
+all_models_ROC = rbind(all_models_ROC, cbind(LDA_roc$ROC_Data, 
+                                             Model = rep("LDA", nrow(LDA_roc$ROC_Data)),
+                                             AUC = rep(LDA_roc$AUC[1], nrow(LDA_roc$ROC_Data))))
+
+
+all_models_ROC = rbind(all_models_ROC, cbind(randomforest_roc$ROC_Data, 
+                                             Model = rep("Random Forest", nrow(randomforest_roc$ROC_Data)),
+                                             AUC = rep(randomforest_roc$AUC[1], nrow(randomforest_roc$ROC_Data))))
+
+all_models_ROC = rbind(all_models_ROC, cbind(xgboost_roc$ROC_Data, 
+                                             Model = rep("XGBoost", nrow(xgboost_roc$ROC_Data)),
+                                             AUC = rep(xgboost_roc$AUC[1], nrow(xgboost_roc$ROC_Data))))
+
+
+all_models_ROC = all_models_ROC %>%
+  mutate(Model_AUC = paste(Model, " (AUC = ", round(AUC, 3), ")", sep = ""))
+
+# Plot the ROC curve with AUC in the legend
+ggplot(all_models_ROC, aes(x = FPR, y = TPR, color = Model_AUC)) +
+  geom_line(size = 1) +
+  geom_abline(
+    slope = 1, intercept = 0, linetype = "dashed", color = "gray", size = 0.8
+  ) +  # Dashed diagonal line for AUC = 0.5
+  labs(
+    title = "ROC Curve",
+    x = "False Positive Rate (FPR)",
+    y = "True Positive Rate (TPR)",
+    color = "Model (AUC)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+```
+
+## Feature Selection
+
+```{r}
+
+genes_common_to_all_models = Reduce(intersect,
+                                    list(ridge_roc$Genes$Genes,
+                                         lasso_roc$Genes$Genes,
+                                         elastic_net_roc$Genes$Genes,
+                                         randomforest_roc$VarImportance$Variable[randomforest_roc$VarImportance$Importance > 10],
+                                         xgboost_roc$VarImportance$Feature[xgboost_roc$VarImportance$Gain > 1E-02]))
+
+
+combined_xgb_rf = inner_join(randomforest_roc$VarImportance[randomforest_roc$VarImportance$Variable %in%
+                                                              genes_common_to_all_models, ],
+                             xgboost_roc$VarImportance, by = c("Variable" = "Feature"))
+
+
+df_scaled = combined_xgb_rf %>%
+  mutate(Importance_scaled = (Importance - min(Importance)) / (max(Importance) - min(Importance)),
+         Gain_scaled = (Gain - min(Gain)) / (max(Gain) - min(Gain)))
+
+# Reshape the scaled data to long format
+df_long = df_scaled %>%
+  gather(key = "Type", value = "Value", Importance_scaled, Gain_scaled) %>%
+  mutate(Model = ifelse(Type == "Importance_scaled", "Random Forest", "XGBoost"))
+
+# Plot
+ggplot(df_long, aes(x = reorder(Variable, Value), y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Random Forest" = "springgreen2", "XGBoost" = "violetred2")) +
+  labs(
+    title = "Scaled Variable Importance | Random Forest vs. XGBoost",
+    x = "Variables",
+    y = "Scaled Importance/Gain",
+    fill = "Model"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

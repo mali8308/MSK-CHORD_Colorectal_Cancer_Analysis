@@ -1,0 +1,510 @@
+# Final Project (BIOL-GA 2031): Colorectal Cancer
+
+**Muhammad Ali** \| N18480700
+
+\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
+### Loading the libraries
+
+```{r}
+
+suppressPackageStartupMessages({
+library(tidyr)
+library(dplyr)
+library(pROC)
+library(randomForest)
+library(ggplot2)
+library(MASS)
+library(e1071)
+library(glmnet)
+})
+
+
+```
+
+\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
+### Loading the data
+
+```{r}
+
+#Demographic data
+data_clinical_patients = read.delim("/Users/ali/Downloads/msk_chord_2024/data_clinical_patient.txt", header = T)
+
+#Has cancer type information
+data_clinical_sample = read.delim("/Users/ali/Downloads/msk_chord_2024/data_clinical_sample.txt", header = T)
+
+#Profile_description: Putative copy-number from GISTIC 2.0. Values: -2 = homozygous deletion; -1 = hemizygous deletion; 0 = neutral / no change; 1 = gain; 2 = high level amplification.
+#Profile_name: Putative copy-number alterations from GISTIC
+data_cna = read.delim("/Users/ali/Downloads/msk_chord_2024/data_cna.txt", header = T)
+data_cna = data.frame(t(data_cna))
+colnames(data_cna) = data_cna[1,]
+data_cna = data_cna[-1,]
+row.names(data_cna) = gsub("\\.","-",row.names(data_cna))
+data_cna[] <- lapply(data_cna, as.integer)
+data_cna$Sample_ID = row.names(data_cna)
+
+#Some sort of mutation data
+data_gene_panel_matrix = read.delim("/Users/ali/Downloads/msk_chord_2024/data_gene_panel_matrix.txt", header = T)
+
+#Some sort of mutation data
+data_mutations = read.delim("/Users/ali/Downloads/msk_chord_2024/data_mutations.txt", header = T)
+
+#Profile_name: Structural Variants
+#Profile_description: Structural Variant Data.
+data_sv = read.delim("/Users/ali/Downloads/msk_chord_2024/data_sv.txt")
+
+#Some temporal data about cancer
+data_timeline_cancer_presence = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_cancer_presence.txt")
+
+#Some temporal diagnosis data
+data_timeline_diagnosis = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_diagnosis.txt")
+
+#Has something called the Gleason score
+data_timeline_gleason = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_gleason.txt")
+
+#Something about MMR presence or absence. 
+data_timeline_mmr = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_mmr.txt")
+
+#Something along the lines of a PDL1 positivity test
+data_timeline_pdl1 = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_pdl1.txt")
+
+#Something about ECOG
+data_timeline_performance_status = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_performance_status.txt")
+
+#Data about prior medication
+data_timeline_prior_meds = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_prior_meds.txt")
+
+#Data about progression
+data_timeline_progression = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_progression.txt")
+
+#Data about raditaion treatment
+data_timeline_radiation = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_radiation.txt")
+
+#Something about sample acquisition and sample IDs
+data_timeline_specimen_surgery = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_specimen_surgery.txt")
+
+#Something about sample ID
+data_timeline_specimen = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_specimen.txt")
+
+#Something about whether the sample was collected or the procedure. 
+data_timeline_surgery = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_surgery.txt")
+
+#Data about treatment type and start and stop date
+data_timeline_treatment = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_treatment.txt")
+
+#Probably data about tests that measure different biomarker levels
+data_timeline_tumor_markers = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_tumor_markers.txt")
+
+#Data about tumor location
+data_timeline_tumor_sites = read.delim("/Users/ali/Downloads/msk_chord_2024/data_timeline_tumor_sites.txt")
+
+#-------------------------------------------------------------------------------
+
+#Case Data
+
+#All samples
+cases_all = data.frame(Sample = t(read.delim("/Users/ali/Downloads/msk_chord_2024/case_lists/cases_all.txt", header = F)))
+
+#Samples with CNA data
+cases_cna = data.frame(Sample_CNA = t(read.delim("/Users/ali/Downloads/msk_chord_2024/case_lists/cases_cna.txt", 
+                                                 header = F)))
+
+#Samples with mutation and CNA data
+cases_cnaseq = data.frame(Sample_CNA_mutation = t(read.delim("/Users/ali/Downloads/msk_chord_2024/case_lists/cases_cnaseq.txt",
+                                                             header = F)))
+
+#Samples with mutation data
+cases_sequenced = data.frame(Sample_mutation = t(read.delim("/Users/ali/Downloads/msk_chord_2024/case_lists/cases_sequenced.txt",
+                                                            header = F)))
+
+#All samples with SV data
+cases_sv = data.frame(Sample_SV = t(read.delim("/Users/ali/Downloads/msk_chord_2024/case_lists/cases_sv.txt",
+                                               header = F)))
+
+
+#-------------------------------------------------------------------------------
+
+#Clinical data directly from cBioPortal
+
+clinical_data_cbio = read.delim("/Users/ali/Downloads/msk_chord_2024_clinical_data-2.tsv")
+
+
+```
+
+\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
+### Custom functions
+
+```{r}
+
+#Removes columns that have NAs in them - machine learning models cannot handle NAs; difficult to impute values when placeholders such as "0" might be used to singify a disease state. Imputation is difficult without making big assumptions, especially since this is beca use some test may not have been performed for certain patients. Therefore, I removed those columns entirely. 
+na_cleanup_columns = function(dataframe)
+{
+  return(dataframe[,colSums(is.na(dataframe)) == 0])
+}
+
+#-------------------------------------------------------------------------------
+
+#Creates training rows
+train_rows = function(x)
+{
+  sample(1:nrow(x),nrow(x)*(2/3), replace = F)
+}
+
+
+```
+
+\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
+Analyze genomic and clinical data differently and then integrate at the end
+
+```{r}
+
+first_join = inner_join(data_clinical_patients, data_clinical_sample, by = c("PATIENT_ID" = "PATIENT_ID"))
+
+second_join = inner_join(first_join, data_gene_panel_matrix, by = c("SAMPLE_ID" = "SAMPLE_ID"))
+
+third_join = inner_join(second_join, data_timeline_diagnosis, by = c("PATIENT_ID" = "PATIENT_ID"))
+
+fourth_join = inner_join(third_join, data_timeline_specimen_surgery, by = c("PATIENT_ID" = "PATIENT_ID"))
+
+fifth_join = inner_join(fourth_join, data_timeline_specimen, by = c("PATIENT_ID" = "PATIENT_ID"))
+
+fifth_join
+
+
+
+
+
+
+
+#Increases the number of rows
+data_mutations
+data_timeline_cancer_presence
+data_timeline_performance_status #(Only need start date and ECOG - higher ECOG scores mean poorer quality of life)
+data_timeline_progression #Can take data from procedure type and of progression
+data_timeline_radiation #Treatment start data of radiation therapy
+data_timeline_surgery #The start date for whether surgery was performed or sample was obtained 
+data_timeline_treatment 
+data_timeline_tumor_markers
+data_timeline_tumor_sites
+
+#reduces the number of rows
+data_timeline_gleason
+data_sv
+data_timeline_mmr
+data_timeline_pdl1
+data_timeline_prior_meds
+
+```
+
+**Training & testing split**
+
+```{r}
+
+set.seed(1010)
+
+clinical_cna_data = na_cleanup_columns(inner_join(clinical_data_cbio, data_cna, by = c("Sample.ID" = "Sample_ID")))
+
+clinical_cna_data_for_model = clinical_cna_data
+
+clinical_cna_data_for_model$Cancer.Type[clinical_cna_data_for_model$Cancer.Type == "Colorectal Cancer"] = 1
+clinical_cna_data_for_model$Cancer.Type[clinical_cna_data_for_model$Cancer.Type != 1] = 0
+
+#-------------------------------------------------------------------------------
+
+#Training-testing split
+training_rows = train_rows(clinical_cna_data_for_model)
+training_data = clinical_cna_data_for_model[training_rows,] 
+testing_data = clinical_cna_data_for_model[-training_rows,] 
+
+#-------------------------------------------------------------------------------
+
+x = training_data[, 36:ncol(training_data)] # Select predictors from column 36 onward
+y = as.factor(training_data$Cancer.Type)   # Convert response variable to factor
+true_labels = testing_data$Cancer.Type  # True labels
+
+data_for_x_y_combined_models = cbind(Cancer_Type = y,x)
+
+```
+
+
+#### Lasso logistic regression
+
+```{r}
+
+# Fit the L1-penalized logistic regression (Lasso)
+cv_lasso_logistic = cv.glmnet(as.matrix(x), y, family = "binomial", alpha = 1, nfolds = 5)
+
+testing_x_regularized_logisitic = as.matrix(testing_data[, 36:ncol(testing_data)])
+lasso_probs = predict(cv_lasso_logistic, 
+                      newx = testing_x_regularized_logisitic,
+                      type = "response",
+                      s=cv_lasso_logistic$lambda.1se)
+
+# Calculate AUC
+roc_lasso = pROC::roc(testing_data$Cancer.Type, lasso_probs)
+
+# Plot ROC Curve
+roc_data = data.frame(TPR = roc_lasso$sensitivities, 
+                      FPR = 1 - roc_lasso$specificities)
+
+ggplot(roc_data, aes(x = FPR, y = TPR)) +
+  geom_line(color = "blue", size = 1) +
+  geom_abline(linetype = "dashed", color = "red") +
+  labs(title = paste("ROC Curve | Lasso Logistic Regression | AUC =", round(roc_lasso$auc, 3)),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal()
+
+```
+
+#### Ridge logistic regression
+
+```{r}
+
+# Fit the L1-penalized logistic regression (Lasso)
+cv_lasso_logistic = cv.glmnet(as.matrix(x), y, family = "binomial", alpha = 0, nfolds = 5)
+
+testing_x_regularized_logisitic = as.matrix(testing_data[, 36:ncol(testing_data)])
+lasso_probs = predict(cv_lasso_logistic, 
+                      newx = testing_x_regularized_logisitic,
+                      type = "response",
+                      s=cv_lasso_logistic$lambda.1se)
+
+# Calculate AUC
+roc_lasso = pROC::roc(testing_data$Cancer.Type, lasso_probs)
+
+# Plot ROC Curve
+roc_data = data.frame(TPR = roc_lasso$sensitivities, 
+                      FPR = 1 - roc_lasso$specificities)
+
+ggplot(roc_data, aes(x = FPR, y = TPR)) +
+  geom_line(color = "blue", size = 1) +
+  geom_abline(linetype = "dashed", color = "red") +
+  labs(title = paste("ROC Curve | Ridge Logistic Regression | AUC =", round(roc_lasso$auc, 3)),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal()
+
+```
+
+#### Elastic-net logistic regression
+
+```{r}
+
+# Fit the L1-penalized logistic regression (Lasso)
+cv_lasso_logistic = cv.glmnet(as.matrix(x), y, family = "binomial", alpha = 0.5, nfolds = 5)
+
+testing_x_regularized_logisitic = as.matrix(testing_data[, 36:ncol(testing_data)])
+lasso_probs = predict(cv_lasso_logistic, 
+                      newx = testing_x_regularized_logisitic,
+                      type = "response",
+                      s=cv_lasso_logistic$lambda.1se)
+
+# Calculate AUC
+roc_lasso = pROC::roc(testing_data$Cancer.Type, lasso_probs)
+
+# Plot ROC Curve
+roc_data = data.frame(TPR = roc_lasso$sensitivities, 
+                      FPR = 1 - roc_lasso$specificities)
+
+ggplot(roc_data, aes(x = FPR, y = TPR)) +
+  geom_line(color = "blue", size = 1) +
+  geom_abline(linetype = "dashed", color = "red") +
+  labs(title = paste("ROC Curve | Elastic-net Logistic Regression | AUC =", round(roc_lasso$auc, 3)),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal()
+
+```
+
+```{r}
+
+coefficients_glmnet = as.data.frame(as.matrix(coef(cv_lasso_logistic, s = cv_lasso_logistic$lambda.1se)))
+
+genes_selected = rownames(coefficients_glmnet)[coefficients_glmnet$s1 != 0][-1] #removing the intercept
+
+```
+
+
+#### Logistic Regression
+
+```{r}
+
+# Fit the logistic regression model
+logistic_model = glm(Cancer_Type ~ ., 
+                     data = data_for_x_y_combined_models, 
+                     family = "binomial")
+
+#summary(logistic_model)
+
+predictions = predict(logistic_model, 
+                      newdata = testing_data[, 36:ncol(testing_data)],
+                      type = "response")
+
+# Convert probabilities to class labels if needed (e.g., using a threshold of 0.5)
+predicted_classes = ifelse(predictions > 0.85, 1, 0)
+
+mean(predicted_classes==testing_data$Cancer.Type)
+
+roc_curve = pROC::roc(true_labels, predictions)
+
+# Extract ROC curve data
+roc_data = data.frame(TPR = roc_curve$sensitivities,  # True positive rate
+                      FPR = 1 - roc_curve$specificities)  # False positive rate
+
+# Create the ROC curve plot
+ggplot(roc_data, aes(x = FPR, y = TPR)) +
+  geom_line(color = "skyblue", size = 1) +
+  geom_abline(linetype = "dashed", color = "red") +  # Diagonal line
+  labs(title = paste("ROC Curve |","AUC =", round(roc_curve$auc, 3)), 
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal()
+
+```
+
+#### Linear discriminant analysis
+
+```{r}
+
+# Fit LDA model
+lda_model = lda(Cancer_Type ~ ., data = data_for_x_y_combined_models)
+
+# Make predictions
+lda_predictions = predict(lda_model, newdata = testing_data[, 36:ncol(testing_data)])
+
+# Predicted probabilities for ROC curve
+lda_probs = lda_predictions$posterior[, 2]  # Probabilities for class "1"
+
+# Calculate AUC
+lda_roc = pROC::roc(testing_data$Cancer.Type, lda_probs)
+
+# Plot ROC curve
+lda_roc_data = data.frame(TPR = lda_roc$sensitivities, 
+                          FPR = 1 - lda_roc$specificities)
+
+ggplot(lda_roc_data, aes(x = FPR, y = TPR)) +
+  geom_line(color = "skyblue", size = 1) +
+  geom_abline(linetype = "dashed", color = "red") +
+  labs(title = paste("ROC Curve | LDA | AUC =", round(lda_roc$auc, 3)),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal()
+
+
+```
+
+
+```{r}
+
+#degree parameter used for polynomial kernels to set the degree of the polynomial.
+
+# Fit SVM model
+svm_model <- svm(Cancer_Type ~ ., 
+                 data = data_for_x_y_combined_models, 
+                 probability = TRUE,
+                 kernel = "radial",
+                 cost = 1)
+
+
+# Make predictions
+svm_probs <- attr(predict(svm_model, newdata = testing_data[, 36:ncol(testing_data)], 
+                          probability = TRUE), "probabilities")[, 2]
+
+# Calculate AUC
+svm_roc <- pROC::roc(testing_data$Cancer.Type, svm_probs)
+print(svm_roc$auc)
+
+# Plot ROC curve
+svm_roc_data <- data.frame(TPR = svm_roc$sensitivities, 
+                           FPR = 1 - svm_roc$specificities)
+ggplot(svm_roc_data, aes(x = FPR, y = TPR)) +
+  geom_line(color = "purple", size = 1) +
+  geom_abline(linetype = "dashed", color = "red") +
+  labs(title = paste("ROC Curve | SVM | AUC =", round(svm_roc$auc, 3)),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal()
+
+
+```
+
+
+
+#-------------------------------------------------------------------------------
+
+
+RANDOM FORESTS taking forever
+
+```{r}
+
+mtry_value = floor(sqrt(ncol(data_for_x_y_combined_models)))
+
+rf_model = randomForest(x = x,
+                        y = y,
+                        mtry = mtry_value, 
+                        ntree = 500,
+                        importance = TRUE)
+
+# Make predictions
+rf_probs = predict(rf_model, newdata = testing_data[, 36:ncol(testing_data)], type = "prob")[, 2]
+
+# Calculate AUC
+rf_roc = pROC::roc(testing_data$Cancer.Type, rf_probs)
+
+# Plot ROC curve
+rf_roc_data = data.frame(TPR = rf_roc$sensitivities, 
+                         FPR = 1 - rf_roc$specificities)
+
+ggplot(rf_roc_data, aes(x = FPR, y = TPR)) +
+  geom_line(color = "darkorange", size = 1) +
+  geom_abline(linetype = "dashed", color = "red") +
+  labs(title = paste("ROC Curve | Random Forest | AUC =", round(rf_roc$auc, 3)),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal()
+
+```
+
+
+QDA NOT WORKING for CNA data
+
+```{r}
+
+# Fit QDA model
+qda_model = qda(Cancer_Type ~ ., data = data_for_x_y_combined_models)
+
+# Make predictions
+qda_predictions = predict(qda_model, 
+                           newdata = testing_data[, 36:ncol(testing_data)])
+
+# Predicted probabilities for ROC curve
+qda_probs <- qda_predictions$posterior[, 2]  # Probabilities for class "1"
+
+# Calculate AUC
+qda_roc <- pROC::roc(testing_data$Cancer.Type, qda_probs)
+print(qda_roc$auc)
+
+# Plot ROC curve
+qda_roc_data <- data.frame(TPR = qda_roc$sensitivities, 
+                           FPR = 1 - qda_roc$specificities)
+ggplot(qda_roc_data, aes(x = FPR, y = TPR)) +
+  geom_line(color = "forestgreen", size = 1) +
+  geom_abline(linetype = "dashed", color = "red") +
+  labs(title = paste("ROC Curve | QDA | AUC =", round(qda_roc$auc, 3)),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal()
+
+
+```
+
+
+
+
+
+### Predictive pipeline
+
+
+#### Discriminant Analysis
+
+#### Random Forests
+
+#### SVM
+
+#### Neural Networks

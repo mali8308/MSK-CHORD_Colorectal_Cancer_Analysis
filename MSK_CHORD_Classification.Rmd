@@ -1,0 +1,1332 @@
+
+# Cancer type Prediction from CNA Enhanced + Other Categorical Predictors
+
+```{r}
+
+suppressPackageStartupMessages({
+library(tidyr)
+library(dplyr)
+library(pROC)
+library(randomForest)
+library(ggplot2)
+library(MASS)
+library(glmnet)
+library(ranger)
+library(doParallel)
+library(foreach)
+library(xgboost)
+library(dbarts)
+})
+
+
+```
+
+```{r}
+
+#Profile_description: Putative copy-number from GISTIC 2.0. Values: -2 = homozygous deletion; -1 = hemizygous deletion; 0 = neutral / no change; 1 = gain; 2 = high level amplification.
+#Profile_name: Putative copy-number alterations from GISTIC
+data_cna = read.delim("/Users/ali/Downloads/msk_chord_2024/data_cna.txt", header = T)
+data_cna = data.frame(t(data_cna))
+colnames(data_cna) = data_cna[1,]
+data_cna = data_cna[-1,]
+row.names(data_cna) = gsub("\\.","-",row.names(data_cna))
+data_cna[] <- lapply(data_cna, as.integer)
+data_cna$Sample_ID = row.names(data_cna)
+
+#-------------------------------------------------------------------------------
+
+#Clinical data directly from cBioPortal
+
+clinical_data_cbio = read.delim("/Users/ali/Downloads/msk_chord_2024_clinical_data-2.tsv")
+
+```
+
+### Custom functions
+
+```{r}
+
+set.seed(1010)
+
+#Removes columns that have NAs in them - machine learning models cannot handle NAs; difficult to impute values when placeholders such as "0" might be used to singify a disease state. Imputation is difficult without making big assumptions, especially since this is beca use some test may not have been performed for certain patients. Therefore, I removed those columns entirely. 
+na_cleanup_columns = function(dataframe)
+{
+  return(dataframe[,colSums(is.na(dataframe)) == 0])
+}
+
+#-------------------------------------------------------------------------------
+
+#Creates training rows
+
+train_rows = function(data, response_column) 
+{
+  # Create a partition with 2/3 of the data for training
+  set.seed(123)  # Set a seed for reproducibility
+  train_index <- caret::createDataPartition(data[[response_column]], p = 2/3, list = FALSE)
+  return(train_index)
+}
+
+#-------------------------------------------------------------------------------
+
+#Custom function that uses glmnet to compute ROC and AUC using parallel computing for logistic regression with varying degrees of L1 and L2 penalties, essentially switching between Ridge, Lasso, and Elastic-net. 
+
+elastic_net_logistic = function(training_x, training_y, a, folds, testing_x, testing_y, parallel)
+
+{
+
+if (parallel == TRUE)
+{
+  # Set up parallel backend
+  cores = parallel::detectCores()
+  cl = makeCluster(cores*(1/2))
+  registerDoParallel(cl)
+  
+  cv_lasso_logistic = cv.glmnet(as.matrix(training_x), training_y, family = "binomial", alpha = a, nfolds = folds, 
+                                parallel = TRUE,
+                                trace.it = 1)
+  
+  # Shut down parallel backend
+  stopCluster(cl)
+  registerDoSEQ()
+}
+
+else
+{cv_lasso_logistic = cv.glmnet(as.matrix(training_x), training_y, family = "binomial", alpha = a, nfolds = folds, trace.it = 1)}
+
+testing_x_regularized_logisitic = as.matrix(testing_x)
+lasso_probs = predict(cv_lasso_logistic, 
+                      newx = testing_x_regularized_logisitic,
+                      type = "response",
+                      s=cv_lasso_logistic$lambda.1se)
+
+coefficients_glmnet = as.data.frame(as.matrix(coef(cv_lasso_logistic, s = cv_lasso_logistic$lambda.1se)))
+coefficients_glmnet$Genes = row.names(coefficients_glmnet)
+genes_selected = coefficients_glmnet[coefficients_glmnet$s1 != 0,][-1,] #removing the intercept
+
+# Calculate AUC
+roc_lasso = pROC::roc(testing_y, lasso_probs)
+
+# Plot ROC Curve
+roc_data = data.frame(TPR = roc_lasso$sensitivities, 
+                      FPR = 1 - roc_lasso$specificities)
+
+return(list(ROC_Data = roc_data, AUC = roc_lasso$auc, Genes = genes_selected, Lambda = cv_lasso_logistic$lambda.1se))
+
+}
+
+#-------------------------------------------------------------------------------
+
+LDA_function = function(training_data, testing_x, testing_y)
+
+{
+  
+lda_model = lda(Cancer_Type ~ ., data = training_data)
+
+# Make predictions
+lda_predictions = predict(lda_model, newdata = testing_x)
+
+# Predicted probabilities for ROC curve
+lda_probs = lda_predictions$posterior[, 2]  # Probabilities for class "1"
+
+# Calculate AUC
+lda_roc = pROC::roc(testing_y, lda_probs)
+
+# Plot ROC curve
+lda_roc_data = data.frame(TPR = lda_roc$sensitivities, 
+                          FPR = 1 - lda_roc$specificities)
+
+return(list(ROC_Data = lda_roc_data, AUC = lda_roc$auc))
+
+}
+
+#-------------------------------------------------------------------------------
+
+logistic_regression = function(training_data, testing_x, testing_y)
+  
+{
+
+logistic_model = glm(Cancer_Type ~ ., 
+                     data = training_data, 
+                     family = "binomial")
+
+predictions = predict(logistic_model, 
+                      newdata = testing_x,
+                      type = "response")
+
+roc_curve = pROC::roc(testing_y, predictions)
+
+# Extract ROC curve data
+roc_data = data.frame(TPR = roc_curve$sensitivities,  # True positive rate
+                      FPR = 1 - roc_curve$specificities)  # False positive rate
+
+return(list(ROC_Data = roc_data, AUC = roc_curve$auc))
+
+}
+
+#-------------------------------------------------------------------------------
+
+random_forest_ranger = function(training_data, training_y, testing_x, testing_y, num_trees, mtry = NA, cores = NA)
+
+{
+  
+mtry_value = mtry
+
+if (is.na(mtry))
+{
+mtry_value = floor(sqrt(ncol(training_data)))  
+}
+
+if (is.na(cores))
+{
+cores = 1
+}
+
+rf_model = ranger(dependent.variable.name = training_y,
+                  data = training_data,
+                  mtry = mtry_value,
+                  num.trees = num_trees,
+                  importance = "impurity",
+                  probability = TRUE,
+                  num.threads = cores,
+                  oob.error = TRUE)  # Number of cores to use
+
+rf_probs = predict(rf_model, data = testing_x)$predictions[, 2]
+
+rf_roc = pROC::roc(testing_y, rf_probs)
+
+rf_roc_data = data.frame(TPR = rf_roc$sensitivities, 
+                         FPR = 1 - rf_roc$specificities)
+
+variable_importance = as.data.frame(rf_model$variable.importance)
+variable_importance$Variable = rownames(variable_importance)
+colnames(variable_importance) = c("Importance", "Variable")
+
+variable_importance = variable_importance[order(variable_importance$Importance, decreasing = TRUE), ]
+
+oob_predictions = rf_model$predictions
+
+# Calculate confidence intervals (95% CI) from OOB predictions
+lower_ci = apply(oob_predictions, 1, function(x) quantile(x, 0.025))  # 2.5% quantile
+upper_ci = apply(oob_predictions, 1, function(x) quantile(x, 0.975))  # 97.5% quantile
+
+# Calculate mean prediction for each sample
+mean_pred = apply(oob_predictions, 1, mean)
+
+# Combine the results into a data frame
+confidence_intervals = data.frame(
+  predicted = mean_pred, 
+  lower_CI = lower_ci, 
+  upper_CI = upper_ci
+)
+
+
+return(list(ROC_Data = rf_roc_data, AUC = rf_roc$auc, VarImportance = variable_importance, 
+            Model = rf_model))
+
+}
+
+#-------------------------------------------------------------------------------
+
+xgboost_parallel = function(training_x, training_y, testing_x, testing_y, learning_rate = NA, cores = NA, n_tree = NA, tree_depth = NA)
+
+{
+  
+if(is.na(learning_rate))
+{
+  learning_rate = 0.3
+}
+
+if(is.na(cores))
+{
+  cores = 1
+}
+
+if(is.na(n_tree))
+{
+  n_tree = 500
+}
+  
+if(is.na(tree_depth))
+{
+  tree_depth = 6
+}
+
+# Separate features and target
+X_train = as.matrix(training_x)
+y_train = as.numeric(training_y) - 1  # Ensure labels are 0-based
+
+X_test = as.matrix(testing_x)
+y_test = as.numeric(testing_y) - 1  # Ensure labels are 0-based
+
+#y_test = as.numeric(test_data_xgb$Cancer.Type) - 1  # Ensure labels are 0-based
+
+
+# Define hyperparameters
+xgb_params = list(objective = "binary:logistic",  # Binary classification
+                  eval_metric = "auc",
+                  max_depth = tree_depth,        # Tree depth
+                  eta = learning_rate)           # Learning rate
+
+# Train the XGBoost model
+xgb_train = xgb.DMatrix(data = X_train, label = y_train)
+
+xgb_model = xgb.train(params = xgb_params,
+                      data = xgb_train,
+                      nrounds = n_tree,
+                      nthread = cores,
+                      verbose = 0)
+
+# Make predictions
+xgb_test = xgb.DMatrix(data = X_test)
+xgb_probs = predict(xgb_model, xgb_test)
+
+# Calculate ROC and plot
+xgb_roc = pROC::roc(y_test, xgb_probs)
+
+xgb_roc_data = data.frame(TPR = xgb_roc$sensitivities,
+                          FPR = 1 - xgb_roc$specificities)
+
+# Variable importance
+xgb_importance = xgb.importance(model = xgb_model, feature_names = colnames(X_train)) %>%
+  arrange(desc(Gain))
+
+return(list(ROC_Data = xgb_roc_data, AUC = xgb_roc$auc, VarImportance = xgb_importance, model = xgb_model))
+
+}
+
+#-------------------------------------------------------------------------------
+
+Spline_function = function(training_x, training_y, testing_x, testing_y) 
+
+{
+  
+  cores = parallel::detectCores()
+  cl = makeCluster(cores*(1/2))
+  registerDoParallel(cl)
+
+  # Fit a smoothing spline model
+  spline_model = smooth.spline(x = training_x, 
+                               y = training_y,
+                               cv = TRUE, 
+                               df = 4,
+                               nknots = 10)
+  
+  # Shut down parallel backend
+  stopCluster(cl)
+  registerDoSEQ()
+  
+  # Predict on testing data
+  spline_predictions = predict(spline_model, testing_x)$y
+  
+  # Calculate AUC
+  spline_roc = pROC::roc(testing_y, spline_predictions)
+  
+  # Prepare data for ROC curve
+  spline_roc_data = data.frame(TPR = spline_roc$sensitivities, 
+                               FPR = 1 - spline_roc$specificities)
+  
+  return(list(ROC_Data = spline_roc_data, AUC = spline_roc$auc))
+}
+
+#-------------------------------------------------------------------------------
+
+GAM_function = function(training_data, testing_x, testing_y) 
+  
+{
+  
+  library(mgcv)
+  library(doParallel)
+  
+  # Set up parallel backend
+  cores = parallel::detectCores()
+  cl = makeCluster(cores * (1 / 2))
+  registerDoParallel(cl)
+  
+  # Fit a GAM model
+  gam_model = gam(
+    formula = Cancer_Type ~ s(., k = 10, bs = "tp"), # "tp" for thin plate regression spline
+    data = training_data,
+    family = binomial,  # Use logistic regression for binary classification
+    method = "REML",    # Restricted Maximum Likelihood for smoothing parameter estimation
+    select = TRUE       # Penalize complexity to encourage simpler models
+  )
+
+  # Shut down parallel backend
+  stopCluster(cl)
+  registerDoSEQ()
+  
+  # Predict probabilities on testing data
+  gam_probs = predict(gam_model, newdata = data.frame(training_x = testing_x), type = "response")
+  
+  # Calculate AUC
+  gam_roc = pROC::roc(testing_y, gam_probs)
+  
+  # Prepare data for ROC curve
+  gam_roc_data = data.frame(TPR = gam_roc$sensitivities, 
+                            FPR = 1 - gam_roc$specificities)
+  
+  return(list(ROC_Data = gam_roc_data, AUC = gam_roc$auc))
+}
+
+#-------------------------------------------------------------------------------
+
+factor_2_integer = function(x)
+{
+  (as.integer(as.factor(x)))
+}
+
+#-------------------------------------------------------------------------------
+
+library(ranger)
+library(pROC)
+library(ggplot2)
+library(parallel)
+
+# Define a function for tuning
+tune_random_forest = function(training_data, training_y, testing_x, testing_y, 
+                               mtry_values, numtree_values, cores = NA) 
+
+{
+  
+  # Set cores
+  if (is.na(cores)) {
+    cores = 1
+  }
+  
+  # Create a grid for hyperparameter tuning
+  results = data.frame(mtry = integer(), num_trees = integer(), AUC = numeric())
+  
+  # Nested loop over mtry and num.trees
+  for (mtry_val in mtry_values) {
+    for (numtree_val in numtree_values) {
+      
+      # Train a random forest with specific mtry and num.trees
+      rf_model = ranger(dependent.variable.name = training_y,
+                        data = training_data,
+                        mtry = mtry_val,
+                        num.trees = numtree_val,
+                        importance = "impurity",
+                        probability = TRUE,
+                        num.threads = cores)
+      
+      # Get predictions on the testing set
+      rf_probs = predict(rf_model, data = testing_x)$predictions[, 2]
+      
+      # Calculate AUC
+      rf_roc = pROC::roc(testing_y, rf_probs)
+      auc_value = rf_roc$auc
+      
+      # Store results
+      results = rbind(results, data.frame(mtry = mtry_val, num_trees = numtree_val, AUC = auc_value))
+    }
+  }
+  
+  # Return results
+  return(results)
+}
+
+
+
+```
+
+**Training & testing split**
+
+```{r}
+
+set.seed(1010)
+
+clinical_cna_data = na_cleanup_columns(inner_join(clinical_data_cbio, data_cna, by = c("Sample.ID" = "Sample_ID")))
+
+dim(clinical_cna_data)
+
+#Use this code to add any other features to the dataset
+clinical_cna_data_for_model = na.omit(inner_join(clinical_cna_data, 
+                                                         clinical_data_cbio[,c("Sample.ID",
+                                                                               "Current.Age",
+                                                                               "Fraction.Genome.Altered",
+                                                                               "MSI.Score",
+                                                                               "Mutation.Count",
+                                                                               "Stage..Highest.Recorded.",
+                                                                               "Overall.Survival..Months.",
+                                                                               "Overall.Survival.Status",
+                                                                               "Tumor.Site..Adrenal.Glands..NLP.",
+                                                                               "Tumor.Site..Bone..NLP.",
+                                                                               "Tumor.Site..CNS.Brain..NLP.",
+                                                                               "Tumor.Site..Intra.Abdominal",
+                                                                               "Tumor.Site..Liver..NLP.",
+                                                                               "Tumor.Site..Lung..NLP.",
+                                                                               "Tumor.Site..Lymph.Node..NLP.",
+                                                                               "Tumor.Site..Pleura..NLP.",
+                                                                               "Tumor.Site..Reproductive.Organs..NLP.")], 
+                                                         by = c("Sample.ID" = "Sample.ID"),
+                                                         suffix = c(".cna", ".cbio") ))
+
+
+dim(clinical_cna_data_for_model)
+
+clinical_cna_data_for_model = clinical_cna_data_for_model[,-grep(".cna",colnames(clinical_cna_data_for_model), ignore.case = T)]
+clinical_cna_data_for_model$Cancer.Type[clinical_cna_data_for_model$Cancer.Type == "Colorectal Cancer"] = 1
+clinical_cna_data_for_model$Cancer.Type[clinical_cna_data_for_model$Cancer.Type != 1] = 0
+
+#-------------------------------------------------------------------------------
+
+#Training-testing split
+training_rows = train_rows(data = clinical_cna_data_for_model,
+                           response_column = "Cancer.Type")
+training_data = clinical_cna_data_for_model[training_rows,] 
+testing_data = clinical_cna_data_for_model[-training_rows,] 
+
+#-------------------------------------------------------------------------------
+
+#Training X
+training_x = training_data[, 36:ncol(training_data)] # Select predictors from column 36 onward
+training_x$Stage..Highest.Recorded..cbio = factor_2_integer(training_x$Stage..Highest.Recorded..cbio)
+training_x$Overall.Survival.Status.cbio = factor_2_integer(training_x$Overall.Survival.Status.cbio)
+training_x$Tumor.Site..Adrenal.Glands..NLP..cbio = factor_2_integer(training_x$Tumor.Site..Adrenal.Glands..NLP..cbio)
+training_x$Tumor.Site..Bone..NLP..cbio = factor_2_integer(training_x$Tumor.Site..Bone..NLP..cbio)
+training_x$Tumor.Site..Bone..NLP..cbio = factor_2_integer(training_x$Tumor.Site..Bone..NLP..cbio)
+training_x$Tumor.Site..CNS.Brain..NLP..cbio = factor_2_integer(training_x$Tumor.Site..CNS.Brain..NLP..cbio)
+training_x$Tumor.Site..Intra.Abdominal.cbio = factor_2_integer(training_x$Tumor.Site..Intra.Abdominal.cbio)
+training_x$Tumor.Site..Liver..NLP..cbio = factor_2_integer(training_x$Tumor.Site..Liver..NLP..cbio)
+training_x$Tumor.Site..Lung..NLP..cbio = factor_2_integer(training_x$Tumor.Site..Lung..NLP..cbio)
+training_x$Tumor.Site..Lymph.Node..NLP..cbio = factor_2_integer(training_x$Tumor.Site..Lymph.Node..NLP..cbio)
+training_x$Tumor.Site..Pleura..NLP..cbio = factor_2_integer(training_x$Tumor.Site..Pleura..NLP..cbio)
+training_x$Tumor.Site..Reproductive.Organs..NLP..cbio = factor_2_integer(training_x$Tumor.Site..Reproductive.Organs..NLP..cbio)
+
+#Training Y
+training_y = as.factor(training_data$Cancer.Type)   # Convert response variable to factor
+
+#Testing X
+testing_x = testing_data[, 36:ncol(testing_data)] # Select predictors from column 36 onward
+testing_x$Stage..Highest.Recorded..cbio = factor_2_integer(testing_x$Stage..Highest.Recorded..cbio)
+testing_x$Overall.Survival.Status.cbio = factor_2_integer(testing_x$Overall.Survival.Status.cbio)
+testing_x$Tumor.Site..Adrenal.Glands..NLP..cbio = factor_2_integer(testing_x$Tumor.Site..Adrenal.Glands..NLP..cbio)
+testing_x$Tumor.Site..Bone..NLP..cbio = factor_2_integer(testing_x$Tumor.Site..Bone..NLP..cbio)
+testing_x$Tumor.Site..Bone..NLP..cbio = factor_2_integer(testing_x$Tumor.Site..Bone..NLP..cbio)
+testing_x$Tumor.Site..CNS.Brain..NLP..cbio = factor_2_integer(testing_x$Tumor.Site..CNS.Brain..NLP..cbio)
+testing_x$Tumor.Site..Intra.Abdominal.cbio = factor_2_integer(testing_x$Tumor.Site..Intra.Abdominal.cbio)
+testing_x$Tumor.Site..Liver..NLP..cbio = factor_2_integer(testing_x$Tumor.Site..Liver..NLP..cbio)
+testing_x$Tumor.Site..Lung..NLP..cbio = factor_2_integer(testing_x$Tumor.Site..Lung..NLP..cbio)
+testing_x$Tumor.Site..Lymph.Node..NLP..cbio = factor_2_integer(testing_x$Tumor.Site..Lymph.Node..NLP..cbio)
+testing_x$Tumor.Site..Pleura..NLP..cbio = factor_2_integer(testing_x$Tumor.Site..Pleura..NLP..cbio)
+testing_x$Tumor.Site..Reproductive.Organs..NLP..cbio = factor_2_integer(testing_x$Tumor.Site..Reproductive.Organs..NLP..cbio)
+
+#Testing Y
+testing_y = as.factor(testing_data$Cancer.Type)  # True labels
+
+data_for_x_y_combined_models = cbind(Cancer_Type = training_y, training_x)
+
+
+
+```
+
+
+#### Logistic Regression
+
+```{r}
+
+logistic_roc = logistic_regression(training_data = data_for_x_y_combined_models,
+                                   testing_x = testing_x,
+                                   testing_y = testing_y)  
+
+```
+
+#### Logistic Regression with L1 and L2 penalty (Ridge, Lasso, Elastic Net)
+
+```{r}
+
+ridge_roc = elastic_net_logistic(training_x = training_x,
+                                 training_y = training_y,
+                                 testing_x = testing_x,
+                                 testing_y = testing_y, 
+                                 a = 0,
+                                 folds = 5,
+                                 parallel = TRUE)
+
+lasso_roc = elastic_net_logistic(training_x = training_x,
+                                 training_y = training_y,
+                                 testing_x = testing_x,
+                                 testing_y = testing_y, 
+                                 a = 1,
+                                 folds = 5,
+                                 parallel = TRUE)
+
+elastic_net_roc = elastic_net_logistic(training_x = training_x,
+                                 training_y = training_y,
+                                 testing_x = testing_x,
+                                 testing_y = testing_y, 
+                                 a = 1,
+                                 folds = 5,
+                                 parallel = TRUE)
+```
+
+#### Linear discriminant analysis
+
+```{r}
+
+LDA_roc = LDA_function(training_data = data_for_x_y_combined_models,
+                       testing_x = testing_x,
+                       testing_y = testing_y)
+
+#QDA did not work - "Rank deficiency in 0" error. 
+
+```
+
+#### Random Forest
+
+```{r}
+
+set.seed(1010)
+
+#Hyperparameter tuning
+
+random_forest_tuning_mtry = data.frame(mtry = seq(1, 2*sqrt(ncol(training_data)), by = 2), 
+                                       AUC = NA)
+
+random_forest_tuning_trees = data.frame(num_trees = seq(100, 10000, by = 400), 
+                                       AUC = NA)
+
+#num_trees = 2000
+for (i in 1:nrow(random_forest_tuning_mtry)) 
+
+{
+  rf_tuning_roc = random_forest_ranger(training_data = data_for_x_y_combined_models,
+                                        training_y = "Cancer_Type",
+                                        testing_x = testing_x,
+                                        testing_y = testing_y,
+                                        num_trees = 2000,
+                                        cores = (detectCores()/2),
+                                       mtry = random_forest_tuning_mtry$mtry[i])
+  
+  random_forest_tuning_mtry$AUC[i] = rf_tuning_roc$AUC
+  
+}
+
+ggplot(random_forest_tuning_mtry, aes(x = mtry, y = AUC)) +
+  geom_line(color = "darkgreen") +
+  geom_point() +
+  labs(title = "AUC for Different mtry Values",
+       x = "mtry Value",
+       y = "AUC",
+       color = "Tuning Parameter") +
+  theme_minimal()
+
+
+
+set.seed(1010)
+
+#mtry = sqrt)ncol(training_data))
+for (i in 1:nrow(random_forest_tuning_trees))
+
+{
+
+  rf_tuning_roc = random_forest_ranger(training_data = data_for_x_y_combined_models,
+                                        training_y = "Cancer_Type",
+                                        testing_x = testing_x,
+                                        testing_y = testing_y,
+                                        num_trees = random_forest_tuning_trees$num_trees[i],
+                                        cores = (detectCores()/2))
+  
+  random_forest_tuning_trees$AUC[i] = rf_tuning_roc$AUC
+    
+}
+
+# Plot using scaled values
+ggplot(random_forest_tuning_trees, aes(x = num_trees, y = AUC)) +
+  geom_line(color = "violetred") +
+  geom_point() +
+  labs(title = "AUC for Different Number of Trees",
+       x = "Number of Trees",
+       y = "AUC",
+       color = "Tuning Parameter") +
+  theme_minimal()
+
+
+random_forest_tuning_trees = random_forest_tuning_trees[order(random_forest_tuning_trees$AUC, decreasing = TRUE),]
+random_forest_tuning_mtry = random_forest_tuning_mtry[order(random_forest_tuning_mtry$AUC, decreasing = TRUE),]
+
+#Tuned model using the parameters that give the best AUC
+
+randomforest_roc = random_forest_ranger(training_data = data_for_x_y_combined_models,
+                                        training_y = "Cancer_Type",
+                                        testing_x = testing_x,
+                                        testing_y = testing_y,
+                                        num_trees = 9700,
+                                        mtry = 13,
+                                        cores = (detectCores()/2))
+
+
+saveRDS(randomforest_roc$Model, "/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/random_forest.rds")
+
+```
+
+
+
+```{r}
+
+
+# Set the number of bootstrap iterations
+n_bootstrap = 50
+
+# Initialize a vector to store the AUC values from each bootstrap sample
+auc_values = numeric(n_bootstrap)
+
+rf_model = randomforest_roc$Model
+
+# Perform bootstrapping
+set.seed(42)  # For reproducibility
+
+for (i in 1:n_bootstrap) 
+
+{
+  # Create a bootstrap sample with replacement
+  bootstrap_indices = sample(1:nrow(testing_x), replace = TRUE)
+  bootstrap_test_x = testing_x[bootstrap_indices, ]
+  bootstrap_test_y = testing_y[bootstrap_indices]
+  
+  # Make predictions with the random forest model on the bootstrap sample
+  rf_probs_bootstrap = predict(rf_model, data = bootstrap_test_x)$predictions[, 2]
+  
+  # Calculate the AUC for the current bootstrap sample
+  roc_bootstrap = pROC::roc(bootstrap_test_y, rf_probs_bootstrap)
+  auc_values[i] = roc_bootstrap$auc
+}
+
+# Calculate the 95% confidence interval for the AUC
+ci_lower = quantile(auc_values, 0.025)
+ci_upper = quantile(auc_values, 0.975)
+
+# Print the confidence interval for the AUC
+cat("AUC Confidence Interval: [", ci_lower, ", ", ci_upper, "]\n")
+
+
+```
+
+
+
+
+```{r}
+
+set.seed(1010)
+
+depth_values = seq(1, 20, by = 1)
+learning_rate_values = seq(0.01, 0.35, by = 0.03)
+xgb_trees = seq(50, 1000, by = 50)
+
+depth_tuning = data.frame(depth = depth_values, AUC = NA)
+learning_rate_tuning = data.frame(learning_rate = learning_rate_values, AUC = NA)
+xgb_trees_tuning = data.frame(num_trees = xgb_trees, AUC = NA)
+
+#With 250 trees
+#learning rate = 0.1
+for (i in 1:nrow(depth_tuning)) 
+
+{
+  xgb_tuning_roc = xgboost_parallel(training_x = training_x,
+                                    training_y = training_y,
+                                    testing_x = testing_x,
+                                    testing_y = testing_y,
+                                    learning_rate = 0.1,
+                                    cores = (detectCores()/2),
+                                    n_tree = 250,
+                                    tree_depth = depth_tuning$depth[i])
+  
+  depth_tuning$AUC[i] = xgb_tuning_roc$AUC
+  
+}
+
+
+ggplot(depth_tuning, aes(x = depth, y = AUC)) +
+  geom_line(color = "dodgerblue2") +
+  geom_point() +
+  labs(title = "AUC for Different Tree Depths",
+       x = "Tree Depth",
+       y = "AUC",
+       color = "Tuning Parameter") +
+  theme_minimal()
+
+
+#With 250 trees
+#Depth = 5
+for (i in 1:nrow(learning_rate_tuning)) 
+
+{
+  xgb_tuning_roc = xgboost_parallel(training_x = training_x,
+                                    training_y = training_y,
+                                    testing_x = testing_x,
+                                    testing_y = testing_y,
+                                    learning_rate = learning_rate_tuning$learning_rate[i],
+                                    cores = (detectCores()/2),
+                                    n_tree = 250,
+                                    tree_depth = 5)
+  
+  learning_rate_tuning$AUC[i] = xgb_tuning_roc$AUC
+  
+}
+
+ggplot(learning_rate_tuning, aes(x = learning_rate, y = AUC)) +
+  geom_line(color = "yellow3") +
+  geom_point() +
+  labs(title = "AUC for Different Learning Rates",
+       x = "Learning Rate",
+       y = "AUC",
+       color = "Tuning Parameter") +
+  theme_minimal()
+
+
+#Depth = 5
+#learning rate = 0.1
+for (i in 1:nrow(xgb_trees_tuning)) 
+
+{
+  xgb_tuning_roc = xgboost_parallel(training_x = training_x,
+                                    training_y = training_y,
+                                    testing_x = testing_x,
+                                    testing_y = testing_y,
+                                    learning_rate = 0.1,
+                                    cores = (detectCores()/2),
+                                    n_tree = xgb_trees_tuning$num_trees[i],
+                                    tree_depth = 5)
+  
+  xgb_trees_tuning$AUC[i] = xgb_tuning_roc$AUC
+  
+}
+
+# Plot using scaled values
+ggplot(xgb_trees_tuning, aes(x = num_trees, y = AUC)) +
+  geom_line(color = "violetred") +
+  geom_point() +
+  labs(title = "AUC for Different Number of Trees",
+       x = "Number of Trees",
+       y = "AUC",
+       color = "Tuning Parameter") +
+  theme_minimal()
+
+xgb_trees_tuning = xgb_trees_tuning[order(xgb_trees_tuning$AUC, decreasing = TRUE),]
+depth_tuning = depth_tuning[order(depth_tuning$AUC, decreasing = TRUE),]
+learning_rate_tuning = learning_rate_tuning[order(learning_rate_tuning$AUC, decreasing = TRUE),]
+
+xgboost_roc = xgboost_parallel(training_x = training_x,
+                               training_y = training_y,
+                               testing_x = testing_x,
+                               testing_y = testing_y,
+                               learning_rate = 0.1,
+                               cores = (detectCores()/2),
+                               n_tree = 600,
+                               tree_depth = 5) 
+
+```
+
+```{r}
+
+# Set the number of bootstrap iterations
+n_bootstrap = 50
+
+# Initialize a vector to store the AUC values from each bootstrap sample
+auc_values = numeric(n_bootstrap)
+
+# Use the trained XGBoost model
+xgb_model = xgboost_roc$model  # Model trained with xgb.train()
+
+# Perform bootstrapping
+set.seed(42)  # For reproducibility
+
+for (i in 1:n_bootstrap) {
+  # Create a bootstrap sample with replacement
+  bootstrap_indices = sample(1:nrow(testing_x), replace = TRUE)
+  bootstrap_test_x = testing_x[bootstrap_indices, ]
+  bootstrap_test_y = testing_y[bootstrap_indices]
+  
+  # Convert the bootstrap data to the DMatrix format
+  xgb_bootstrap_test = xgb.DMatrix(data = as.matrix(bootstrap_test_x))
+  
+  # Make predictions with the XGBoost model on the bootstrap sample
+  xgb_probs_bootstrap = predict(xgb_model, xgb_bootstrap_test)
+  
+  # Calculate the AUC for the current bootstrap sample
+  roc_bootstrap = pROC::roc(bootstrap_test_y, xgb_probs_bootstrap)
+  auc_values[i] = roc_bootstrap$auc
+}
+
+# Calculate the 95% confidence interval for the AUC
+ci_lower = quantile(auc_values, 0.025)
+ci_upper = quantile(auc_values, 0.975)
+
+# Print the confidence interval for the AUC
+cat("AUC Confidence Interval: [", ci_lower, ", ", ci_upper, "]\n")
+
+```
+
+
+```{r}
+
+#Spline_roc = Spline_function(training_x = training_x,
+#                             training_y = training_y,
+#                             testing_x = testing_x,
+#                             testing_y = testing_y)
+
+#GAM_roc = GAM_function(training_data = data_for_x_y_combined_models,
+#                       testing_x = testing_x,
+#                       testing_y = testing_y)
+
+```
+
+
+#### ROC Compilation
+
+```{r}
+
+all_models_ROC = data.frame(TPR = ridge_roc$ROC_Data$TPR,
+                            FPR = ridge_roc$ROC_Data$FPR,
+                            Model = rep("Ridge Logistic", nrow(ridge_roc$ROC_Data)),
+                            AUC = rep(ridge_roc$AUC[1], nrow(ridge_roc$ROC_Data)))
+
+all_models_ROC = rbind(all_models_ROC, cbind(lasso_roc$ROC_Data, 
+                                             Model = rep("Lasso Logistic", nrow(lasso_roc$ROC_Data)),
+                                             AUC = rep(lasso_roc$AUC[1], nrow(lasso_roc$ROC_Data))))
+
+all_models_ROC = rbind(all_models_ROC, cbind(elastic_net_roc$ROC_Data, 
+                                             Model = rep("Elastic Net Logistic", nrow(elastic_net_roc$ROC_Data)),
+                                             AUC = rep(elastic_net_roc$AUC[1], nrow(elastic_net_roc$ROC_Data))))
+
+
+all_models_ROC = rbind(all_models_ROC, cbind(logistic_roc$ROC_Data, 
+                                             Model = rep("Logistic Regression", nrow(logistic_roc$ROC_Data)),
+                                             AUC = rep(logistic_roc$AUC[1], nrow(logistic_roc$ROC_Data))))
+
+
+all_models_ROC = rbind(all_models_ROC, cbind(LDA_roc$ROC_Data, 
+                                             Model = rep("LDA", nrow(LDA_roc$ROC_Data)),
+                                             AUC = rep(LDA_roc$AUC[1], nrow(LDA_roc$ROC_Data))))
+
+
+all_models_ROC = rbind(all_models_ROC, cbind(randomforest_roc$ROC_Data, 
+                                             Model = rep("Random Forest", nrow(randomforest_roc$ROC_Data)),
+                                             AUC = rep(randomforest_roc$AUC[1], nrow(randomforest_roc$ROC_Data))))
+
+all_models_ROC = rbind(all_models_ROC, cbind(xgboost_roc$ROC_Data, 
+                                             Model = rep("XGBoost", nrow(xgboost_roc$ROC_Data)),
+                                             AUC = rep(xgboost_roc$AUC[1], nrow(xgboost_roc$ROC_Data))))
+
+
+all_models_ROC = all_models_ROC %>%
+  mutate(Model_AUC = paste(Model, " (AUC = ", round(AUC, 3), ")", sep = ""))
+
+# Plot the ROC curve with AUC in the legend
+ggplot(all_models_ROC, aes(x = FPR, y = TPR, color = Model_AUC)) +
+  geom_line(size = 1) +
+  geom_abline(
+    slope = 1, intercept = 0, linetype = "dashed", color = "gray", size = 0.8
+  ) +  # Dashed diagonal line for AUC = 0.5
+  labs(
+    title = "Validation Set ROC Curve",
+    x = "False Positive Rate (FPR)",
+    y = "True Positive Rate (TPR)",
+    color = "Model (AUC)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/ROC_Curve.png",
+       width = 10, height = 10, dpi = 300)
+
+```
+
+## Feature Selection
+
+```{r}
+
+genes_common_to_all_models = Reduce(intersect,
+                                    list(ridge_roc$Genes$Genes,
+                                         lasso_roc$Genes$Genes,
+                                         elastic_net_roc$Genes$Genes,
+                                         randomforest_roc$VarImportance$Variable[randomforest_roc$VarImportance$Importance > 10],
+                                         xgboost_roc$VarImportance$Feature[xgboost_roc$VarImportance$Gain > 1E-02]))
+
+
+combined_xgb_rf = inner_join(randomforest_roc$VarImportance[randomforest_roc$VarImportance$Variable %in%
+                                                              genes_common_to_all_models, ],
+                             xgboost_roc$VarImportance, by = c("Variable" = "Feature"))
+
+
+df_scaled = combined_xgb_rf %>%
+  mutate(Importance_scaled = (Importance - min(Importance)) / (max(Importance) - min(Importance)),
+         Gain_scaled = (Gain - min(Gain)) / (max(Gain) - min(Gain)))
+
+# Reshape the scaled data to long format
+df_long = df_scaled %>%
+  gather(key = "Type", value = "Value", Importance_scaled, Gain_scaled) %>%
+  mutate(Model = ifelse(Type == "Importance_scaled", "Random Forest", "XGBoost"))
+
+# Plot
+ggplot(df_long, aes(x = reorder(Variable, Value), y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Random Forest" = "springgreen2", "XGBoost" = "violetred2")) +
+  labs(
+    title = "Scaled Variable Importance | Random Forest vs. XGBoost",
+    x = "Variables",
+    y = "Scaled Importance/Gain",
+    fill = "Model"
+  ) +
+  theme_minimal()
+
+unique(df_long$Variable)
+
+ggsave("/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/importance_plot.png",
+       width = 15, height = 10, dpi = 300)
+
+```
+
+
+
+```{r}
+
+cna_imp_features = clinical_cna_data_for_model[,c("Sample.ID",genes_common_to_all_models,"Cancer.Type")]
+
+cna_imp_features_cr_cancer = cna_imp_features[cna_imp_features$Cancer.Type == "1",]
+
+imp_genes_cna = cna_imp_features[,2:5]
+imp_genes_cna_cr = cna_imp_features_cr_cancer[,2:5]
+
+```
+
+```{r}
+
+cna_imp_features_pivot = as.data.frame(t(imp_genes_cna))
+
+cna_imp_features_pivot$patients_altered[1] = ncol(cna_imp_features_pivot[,abs(cna_imp_features_pivot[1,])>0])
+cna_imp_features_pivot$patients_altered[2] = ncol(cna_imp_features_pivot[,abs(cna_imp_features_pivot[2,])>0])
+cna_imp_features_pivot$patients_altered[3] = ncol(cna_imp_features_pivot[,abs(cna_imp_features_pivot[3,])>0])
+cna_imp_features_pivot$patients_altered[4] = ncol(cna_imp_features_pivot[,abs(cna_imp_features_pivot[4,])>0])
+
+cna_imp_features_pivot$patients_altered
+
+ggplot(cna_imp_features_pivot, aes(x = row.names(cna_imp_features_pivot), y = patients_altered, fill = row.names(cna_imp_features_pivot))) +
+  geom_bar(stat = "identity", width = 0.4) +
+  labs(
+    title = "CNA for the Important Colorectal Cancer Genes in All Patients",
+    x = "Genes",
+    y = "Number of Patients with Copy Number Alterations"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 0.5)) + # Rotate x-axis labels for readability
+  scale_fill_discrete(name = "Features") # Add legend for clarity
+
+
+```
+```{r}
+
+statistics_cna = cna_imp_features_pivot[,-ncol(cna_imp_features_pivot)]
+
+statistics_cna = as.data.frame(t(statistics_cna))
+
+df_long <- pivot_longer(statistics_cna, cols = everything(), names_to = "Group", values_to = "Value")
+
+# Perform ANOVA
+anova_result <- aov(Value ~ Group, data = df_long)
+summary(anova_result)
+
+# If ANOVA is significant, perform pairwise comparisons
+tukey_result <- TukeyHSD(anova_result)
+print(tukey_result)
+
+write.csv(as.data.frame(tukey_result$Group), "/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/tukey_results_1.csv")
+
+```
+
+```{r}
+
+cna_imp_features_pivot = as.data.frame(t(imp_genes_cna_cr))
+
+cna_imp_features_pivot$patients_altered[1] = ncol(cna_imp_features_pivot[,abs(cna_imp_features_pivot[1,])>0])
+cna_imp_features_pivot$patients_altered[2] = ncol(cna_imp_features_pivot[,abs(cna_imp_features_pivot[2,])>0])
+cna_imp_features_pivot$patients_altered[3] = ncol(cna_imp_features_pivot[,abs(cna_imp_features_pivot[3,])>0])
+cna_imp_features_pivot$patients_altered[4] = ncol(cna_imp_features_pivot[,abs(cna_imp_features_pivot[4,])>0])
+
+cna_imp_features_pivot$patients_altered
+
+ggplot(cna_imp_features_pivot, aes(x = row.names(cna_imp_features_pivot), y = patients_altered, fill = row.names(cna_imp_features_pivot))) +
+  geom_bar(stat = "identity", width = 0.4) +
+  labs(
+    title = "CNA for the Important Colorectal Cancer Genes in Colorectal Cancer Patients",
+    x = "Genes",
+    y = "Number of Patients with Copy Number Alterations"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 0.5)) + # Rotate x-axis labels for readability
+  scale_fill_discrete(name = "Features") # Add legend for clarity
+
+
+```
+```{r}
+statistics_cna = cna_imp_features_pivot[,-ncol(cna_imp_features_pivot)]
+
+statistics_cna = as.data.frame(t(statistics_cna))
+
+df_long <- pivot_longer(statistics_cna, cols = everything(), names_to = "Group", values_to = "Value")
+
+# Perform ANOVA
+anova_result <- aov(Value ~ Group, data = df_long)
+summary(anova_result)
+
+# If ANOVA is significant, perform pairwise comparisons
+tukey_result <- TukeyHSD(anova_result)
+print(tukey_result)
+
+write.csv(as.data.frame(tukey_result$Group), "/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/tukey_results.csv")
+
+```
+
+
+```{r}
+
+clinical_cancer_data_colorectal = clinical_cna_data[clinical_cna_data$Cancer.Type == "Colorectal Cancer",]
+
+data_colorectal_tumor_site = clinical_cancer_data_colorectal[,grep("Tumor.Site..", colnames(clinical_cancer_data_colorectal))]
+
+data_colorectal_tumor_site = cbind(Sample.ID = clinical_cancer_data_colorectal$Sample.ID,
+                                   data_colorectal_tumor_site)
+
+```
+
+
+```{r}
+
+# Pivot longer while keeping the ID column
+long_data <- data_colorectal_tumor_site %>%
+  pivot_longer(
+    cols = starts_with("Tumor.Site"),
+    names_to = "Tumor_Site",
+    values_to = "Response"
+  ) %>%
+  mutate(
+    Tumor_Site = gsub("Tumor\\.Site\\.\\.|\\.NLP\\.", "", Tumor_Site),
+    ID = as.factor(Sample.ID) # Ensure ID is treated as a factor
+  )
+
+ggplot(long_data %>% filter(Response == "Yes"), aes(x = Tumor_Site)) +
+  geom_bar(fill = "violetred2", width = 0.4) +
+  labs(title = "Count of Yes Responses by Tumor Site", x = "Tumor Site", y = "Count") +
+  theme_minimal()
+
+```
+```{r}
+
+#clinical_cancer_data_colorectal = clinical_cna_data[clinical_cna_data$Cancer.Type == "Colorectal Cancer",]
+
+data_colorectal_tumor_site = clinical_cna_data[,grep("Tumor.Site..", colnames(clinical_cna_data))]
+
+data_colorectal_tumor_site = cbind(Cancer_Type = clinical_cna_data$Cancer.Type,
+                                   data_colorectal_tumor_site)
+
+# Pivot data to long format
+long_data <- data_colorectal_tumor_site %>%
+  pivot_longer(
+    cols = starts_with("Tumor.Site"),
+    names_to = "Tumor_Site",
+    values_to = "Response"
+  ) %>%
+  mutate(
+    Tumor_Site = gsub("Tumor\\.Site\\.\\.|\\.NLP\\.", "", Tumor_Site) # Clean column names
+  )
+
+ggplot(long_data %>% filter(Response == "Yes"), aes(x = Tumor_Site)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Count of 'Yes' Responses by Tumor Site", x = "Tumor Site", y = "Count") +
+  theme_minimal()
+
+long_data <- data_colorectal_tumor_site %>%
+  pivot_longer(
+    cols = starts_with("Tumor.Site"),
+    names_to = "Tumor_Site",
+    values_to = "Response"
+  ) %>%
+  mutate(
+    Tumor_Site = gsub("Tumor\\.Site\\.\\.|\\.NLP\\.", "", Tumor_Site), # Clean column names
+    Response = ifelse(Response == "Yes", 1, 0) # Convert to numeric for plotting
+  )
+
+# Create Proportional Stacked Barplot
+ggplot(long_data, aes(x = Tumor_Site, fill = Cancer_Type, weight = Response)) +
+  geom_bar(position = "fill") +
+  scale_fill_brewer(palette = "Set2") + # Use a colorblind-friendly palette
+  labs(
+    title = "Proportional 'Yes' Responses by Tumor Site and Cancer Type",
+    x = "Tumor Site",
+    y = "Proportion",
+    fill = "Cancer Type"
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r}
+
+library(org.Hs.eg.db)
+library(clusterProfiler)
+
+genes_colorectal = c("ASXL1", "CCND1", "CDKN2A", "FLT3")
+
+GO_enrichment_decrease = enrichGO(gene = genes_colorectal,
+                         OrgDb = "org.Hs.eg.db",
+                         keyType = "SYMBOL",
+                         pvalueCutoff = 0.05,
+                         pAdjustMethod = "fdr",
+                         #universe = row.names(skeletage_counts),
+                         qvalueCutoff = 0.05,
+                         ont = "MF")
+
+plot(barplot(GO_enrichment_decrease, showCategory = 7))
+
+ggsave("/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/MF_plot.png",
+       width = 15, height = 10, dpi = 300)
+
+```
+
+
+```{r}
+
+GO_enrichment_decrease = enrichGO(gene = genes_colorectal,
+                         OrgDb = "org.Hs.eg.db",
+                         keyType = "SYMBOL",
+                         pvalueCutoff = 0.05,
+                         pAdjustMethod = "fdr",
+                         #universe = row.names(skeletage_counts),
+                         qvalueCutoff = 0.05,
+                         ont = "BP")
+
+plot(barplot(GO_enrichment_decrease, showCategory = 7))
+
+ggsave("/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/BP_plot.png",
+       width = 15, height = 10, dpi = 300)
+
+```
+
+```{r}
+
+
+age_data = clinical_data_cbio[,c("Current.Age", "Cancer.Type")]
+
+age_data_longer <- age_data %>% pivot_longer(cols = Cancer.Type, names_to = "Cancer.Type", values_to = "Cancer_Type")
+
+tukey_result <- TukeyHSD(aov(age_data_longer$Current.Age ~ age_data_longer$Cancer_Type))
+print(tukey_result)
+
+write.csv(as.data.frame(tukey_result$`age_data_longer$Cancer_Type`), "/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/age_data.csv")
+
+ggplot(age_data, aes(x = Cancer.Type, y = Current.Age, fill = Cancer.Type)) +
+  geom_boxplot() +
+  labs(x = "Cancer Type", y = "Age") +
+  theme_minimal()
+
+ggsave("/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/Age_plot.png",
+       width = 15, height = 10, dpi = 300)
+
+```
+
+```{r}
+
+msi_data = clinical_data_cbio[,c("MSI.Score", "Cancer.Type")]
+
+msi_data_longer <- msi_data %>% pivot_longer(cols = Cancer.Type, names_to = "Cancer.Type", values_to = "Cancer_Type")
+
+tukey_result <- TukeyHSD(aov(msi_data_longer$MSI.Score ~ msi_data_longer$Cancer_Type))
+print(tukey_result)
+
+write.csv(as.data.frame(tukey_result$`msi_data_longer$Cancer_Type`), "/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/msi_data.csv")
+
+
+ggplot(msi_data, aes(x = Cancer.Type, y = log(MSI.Score), fill = Cancer.Type)) +
+  geom_violin() +
+  labs(x = "Cancer Type", y = "Log of MSI Score") +
+  theme_minimal()
+
+ggsave("/Users/ali/Desktop/NYU/3rd Semester/Machine Learning in Genomics/Project/MSI_plot.png",
+       width = 15, height = 10, dpi = 300)
+
+```
+
+
+
+#-------------------------------------------------------------------------------
+
+KEGG connection cannot be established
+
+```{r}
+#GO_enrichment_decrease = enrichKEGG(gene = genes_colorectal,
+#                                    organism = "hsa",
+#                         keyType = "SYMBOL",
+#                         pvalueCutoff = 0.05,
+#                         pAdjustMethod = "fdr",
+#                         #universe = row.names(skeletage_counts),
+#                         qvalueCutoff = 0.05)
+
+#plot(barplot(GO_enrichment_decrease, showCategory = 7))
+
+```
+
+
+
+
+Scaling does NOT improve performance
+
+```{r}
+
+#Scaled training and testing sets
+
+#Training X
+#training_x = training_data[, 36:ncol(training_data)] # Select predictors from column 36 onward
+#training_x$Stage..Highest.Recorded..y = as.integer(as.factor(training_x$Stage..Highest.Recorded..y))
+#training_x$Current.Age = scale(training_x$Current.Age)
+#training_x$Fraction.Genome.Altered = scale(training_x$Fraction.Genome.Altered)
+#training_x$MSI.Score = scale(training_x$MSI.Score)
+#training_x$Mutation.Count = scale(training_x$Mutation.Count)
+
+#Training Y
+#training_y = as.factor(training_data$Cancer.Type)   # Convert response variable to factor
+
+#Testing X
+#testing_x = testing_data[, 36:ncol(testing_data)] # Select predictors from column 36 onward
+#testing_x$Stage..Highest.Recorded..y = as.integer(as.factor(testing_x$Stage..Highest.Recorded..y))
+#testing_x$Current.Age = scale(testing_x$Current.Age)
+#testing_x$Fraction.Genome.Altered = scale(testing_x$Fraction.Genome.Altered)
+#testing_x$MSI.Score = scale(testing_x$MSI.Score)
+#testing_x$Mutation.Count = scale(testing_x$Mutation.Count)
+
+#Testing Y
+#testing_y = as.factor(testing_data$Cancer.Type)  # True labels
+
+#data_for_x_y_combined_models = cbind(Cancer_Type = training_y, training_x)
+
+#unique(clinical_cna_data$Sample.Class)
+#clinical_cna_data
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
